@@ -1,0 +1,101 @@
+openapi: 3.0.0
+info:
+  title: "⚡ Micro-Minimum-Useless: Key-Value Edition"
+  description: "Ultra-minimalist x86_64 Assembly KV Store with deterministic sharding."
+  version: "1.1.0"
+
+servers:
+  - url: http://localhost:8080
+    description: ASM Binary Sharded Engine
+
+paths:
+  /live:
+    get:
+      summary: Liveness probe
+      description: Returns 200 OK if the TCP server is accepting connections.
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Alive"
+
+  /ready:
+    get:
+      summary: Readiness probe
+      description: Returns 200 OK if all 27 shards are correctly memory-mapped.
+      responses:
+        '200':
+          description: Database is ready
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Ready"
+
+  /stats:
+    get:
+      summary: Global Key Count
+      description: Aggregates the TotalKeyCount header from all 27 shards.
+      responses:
+        '200':
+          description: Total number of keys stored
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "1250"
+
+  /{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        description: Key name (Max 31 chars). Deterministically routed to its shard.
+        schema:
+          type: string
+          maxLength: 31
+
+    get:
+      summary: Retrieve a value
+      description: Binary search within the specific shard ($O(\log N)$).
+      responses:
+        '200':
+          description: Value found
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Key not found in shard
+
+    post:
+      summary: Store or Update a value
+      description: Inserts a value (max 224 bytes) and flushes to disk via msync.
+      requestBody:
+        required: true
+        description: Raw data to store.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              maxLength: 224
+      responses:
+        '200':
+          description: Stored successfully
+        '507':
+          description: Shard full (4095 keys limit reached)
+        '400':
+          description: Invalid key or request format
+
+    delete:
+      summary: Remove a key
+      description: Deletes the key and compacts the memory map to maintain search integrity.
+      responses:
+        '200':
+          description: Deleted successfully
+        '404':
+          description: Key not found
