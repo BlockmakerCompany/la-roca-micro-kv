@@ -2,6 +2,7 @@
 
 **The 10KB Database: Pure Metal. Zero Compromise.**
 
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-20KB-blue?logo=docker&logoColor=white)](https://hub.docker.com/r/blockmaker/la-roca-kv)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Binary Size](https://img.shields.io/badge/Binary%20Size-10KB-blue)
 ![Language](https://img.shields.io/badge/Language-Assembly%20x86__64-red)
@@ -11,6 +12,13 @@
 La Roca is a high-performance, transactional Key-Value store written in **pure x86_64 Assembly**.
 Built with zero dependencies and targeting the Linux Kernel directly via syscalls,
 it achieves extreme efficiency and atomic resilience in a tiny binary footprint.
+
+## 🚀 Quick Start (Docker)
+Run "La Roca" in seconds without installing any dependencies:
+
+```bash
+docker run -d -p 8080:8080 --name la-roca blockmaker/la-roca-kv:latest
+```
 
 ---
 

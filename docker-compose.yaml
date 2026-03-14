@@ -1,10 +1,13 @@
 version: '3.8'
 
 services:
-  api:
+  la-roca:
+    # Pull the official high-performance image from BlockMaker Hub.
+    image: blockmaker/la-roca-kv:latest
+    container_name: la-roca-engine
+    
+    # Allows local builds for developers modifying the Assembly source.
     build: .
-    container_name: kvs-api
-    image: micro-kv-asm:1.0.0
 
     # ⚡ "The Immortal Choice": Force a violent termination (SIGKILL).
     # This demonstrates absolute confidence in our Write-Ahead Logging (WAL)
@@ -15,16 +18,18 @@ services:
     ports:
       - "8080:8080"
 
+    # Engine runtime configuration
     environment:
       - LOG_LEVEL=trace      # Options: trace, error, none
       - ROCK_PORT=8080
-      - ROCK_KEY_SIZE=32     # Initial key geometry
-      - ROCK_SLOT_SIZE=1024  # Total record size (1KB)
+      - ROCK_KEY_SIZE=32     # Maximum key geometry
+      - ROCK_SLOT_SIZE=1024  # Total fixed-size record (1KB)
 
+    # 💾 Persistence: Commented by default to prevent interference 
+    # with the automated test suite's internal lifecycle management.
     # volumes:
-    #   # Uncomment for real persistence outside the test suite:
     #   - ./db:/app/db
 
-    # Keep as 'no' so test scripts (test_recovery.sh) maintain
-    # full control over the container lifecycle.
+    # Set to 'no' so the test runner (test_recovery.sh) maintains
+    # exclusive control over the container resurrection logic.
     restart: no
