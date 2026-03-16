@@ -563,6 +563,11 @@ The chart automatically configures a **Headless Service** and an **Envoy Front-P
 
 > **Engineering Tip:** To achieve the performance levels seen in our reports (2,300+ req/s), ensure your Kubernetes nodes have enough headroom to avoid the orchestrator's CPU throttling.
 
+#### 🔍 Note on Distributed Search (Aggregator Pattern)
+By design, **La Roca** is a point-access engine optimized for $O(1)$ complexity. In a sharded cluster, while `GET` and `POST` operations are routed deterministically by Envoy, complex `SEARCH` queries follow a **Scatter-Gather** pattern.
+
+To maintain the core's 10KB "Zero-Bloat" footprint, we handle distributed searches through an **Aggregator Sidecar**. This auxiliary service queries all shards in parallel and merges the results, ensuring that the Assembly core remains dedicated to high-speed register-level persistence without network coordination overhead.
+
 ---
 
 
@@ -942,6 +947,17 @@ To monitor the internal routing and storage decisions in real-time:
 ```bash
 docker-compose logs -f kvs-api
 ```
+
+---
+
+## 🗺️ Roadmap & Future Vision
+
+We are just scratching the surface of what "Back-to-the-Metal" engineering can do.
+
+* [ ] **The Overseer (Aggregator v1):** A high-concurrency coordinator in Go/Rust to handle multi-shard aggregate queries.
+* [ ] **io_uring Integration:** Moving beyond standard syscalls to leverage Linux's latest asynchronous I/O interface for even lower latency.
+* [ ] **Hardware-Locked Shards:** Native support for CPU pinning (affinity) directly from the engine configuration.
+* [ ] **Prometheus Exporter (Assembly-native):** Real-time metrics exported directly from the core without external dependencies.
 
 ---
 
