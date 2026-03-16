@@ -1,0 +1,9 @@
+apiVersion: v2
+name: la-roca
+description: A Helm chart for La Roca Micro-KV (Assembly-native persistence engine)
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+maintainers:
+  - name: "Fernando Mancuso"
+    email: "fernando.mancuso@blockmaker.com"

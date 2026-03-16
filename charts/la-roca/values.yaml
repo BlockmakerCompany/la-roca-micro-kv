@@ -1,0 +1,45 @@
+# Default values for La Roca Micro-KV.
+# This architecture is designed for high-density, low-latency deployments.
+
+replicaCount: 3
+
+image:
+  repository: blockmaker/la-roca-core
+  pullPolicy: IfNotPresent
+  # Overridden by the appVersion in Chart.yaml if not set
+  tag: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Resource limits based on STRESS-01-BASE and STRESS-04-FINAL benchmarks.
+# The "Cage" ensures deterministic performance and prevents CPU throttling
+# from unpredictable background processes.
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Sharding configuration for internal engine optimization.
+sharding:
+  enabled: true
+  count: 8
+
+# Persistent storage configuration for WAL (Write Ahead Log).
+persistence:
+  enabled: true
+  size: 10Gi
+  accessMode: ReadWriteOnce
+
+# Envoy Proxy Configuration
+proxy:
+  enabled: true
+  replicas: 1
+  image: envoyproxy/envoy:v1.27.0
+  service:
+    type: LoadBalancer
+    port: 80

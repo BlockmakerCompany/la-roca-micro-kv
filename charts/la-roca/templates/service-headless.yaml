@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la-roca.fullname" . }}-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "la-roca.name" . }}
+  ports:
+    - port: 8080
+      targetPort: 8080

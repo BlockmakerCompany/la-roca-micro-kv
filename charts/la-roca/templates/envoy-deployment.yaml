@@ -1,0 +1,28 @@
+{{- if .Values.proxy.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "la-roca.fullname" . }}-proxy
+spec:
+  replicas: {{ .Values.proxy.replicas }}
+  selector:
+    matchLabels:
+      app: la-roca-proxy
+  template:
+    metadata:
+      labels:
+        app: la-roca-proxy
+    spec:
+      containers:
+        - name: envoy
+          image: {{ .Values.proxy.image }}
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/envoy
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ include "la-roca.fullname" . }}-envoy-config
+{{- end }}

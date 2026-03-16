@@ -540,6 +540,29 @@ clusters:
 
 > **Why this works:** Since our engine is so lightweight, you can run hundreds of nodes on a single machine, each pinned to a specific CPU core, achieving near-hardware-limit performance across the entire keyspace.
 
+### ☸️ Kubernetes Deployment (Helm)
+
+For production-grade environments, we provide a **Zero-Bloat Helm Chart** designed to orchestrate a high-performance cluster in seconds. This isn't just a deployment script; it's a pre-configured architecture that leverages **Envoy Proxy** to handle distributed state.
+
+#### Quick Start
+```bash
+# Clone the repository
+git clone https://github.com/blockmaker/la-roca-micro-kv.git
+cd la-roca-micro-kv
+
+# Deploy the full cluster (Core + Envoy Proxy)
+helm install la-roca ./charts/la-roca
+```
+
+#### The "Caged" Architecture
+The chart automatically configures a **Headless Service** and an **Envoy Front-Proxy** with the following features:
+
+* **Consistent Ring Hashing:** Envoy is pre-configured to route requests based on the `x-key` header. This ensures that even as you scale, a specific key always hits the same Assembly-native shard.
+* **Resource Pinning:** Each pod is "caged" with the exact CPU/RAM limits validated in our [Benchmarks](./BENCHMARKS.md), ensuring deterministic micro-latency.
+* **Automatic Discovery:** Envoy dynamically updates its hash ring as Kubernetes scales the La Roca pods up or down.
+
+> **Engineering Tip:** To achieve the performance levels seen in our reports (2,300+ req/s), ensure your Kubernetes nodes have enough headroom to avoid the orchestrator's CPU throttling.
+
 ---
 
 
