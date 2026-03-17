@@ -13,6 +13,19 @@ La Roca is a high-performance, transactional Key-Value store written in **pure x
 Built with zero dependencies and targeting the Linux Kernel directly via syscalls,
 it achieves extreme efficiency and atomic resilience in a tiny binary footprint.
 
+---
+
+### 💡 Why La Roca? (The "Why" behind the "Metal")
+Modern infrastructure is bloated. Standard databases (Redis, Memcached) carry heavy runtimes that tax your CPU and RAM before processing a single byte of data. **La Roca eliminates the "Abstraction Tax."**
+
+* **95% Less Footprint:** Replace 200MB containers with a 10KB binary.
+* **Zero Jitter:** No Garbage Collection, no runtime overhead. Just deterministic latency.
+* **Cloud Cost Efficiency:** Handle 2,300+ req/s with 0.5 CPU cores. Scale your throughput, not your bill.
+
+**Perfect for:** Edge Computing, High-Frequency Trading (HFT), Sidecar Rate-Limiters, and IoT gateways where every millicore counts.
+
+---
+
 ## 🚀 Quick Start (Docker)
 Run "La Roca" in seconds without installing any dependencies:
 
