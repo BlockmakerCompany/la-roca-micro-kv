@@ -153,12 +153,12 @@ init_storage:
     ; Offset 16 = Root Pointer
     ; Offset 24 = Next Free Pointer (Allocator)
     ; =========================================================================
-    mov qword [rbx + 16], 0     ; 0 significa que aún no hay nodo raíz
-    mov qword [rbx + 24], 256   ; La memoria libre arranca justo después del Header
+    mov qword [rbx + 16], 0     ; 0 indicates no root node exists yet
+    mov qword [rbx + 24], 256   ; Free memory allocation starts right after the Header
 
-    ; Llamar a inicializar el árbol para ESTE shard específico
-    mov rdi, rbx                ; RDI = Puntero base (mmap) del Shard actual
-    call btree_init             ; Crea el nodo raíz de 4KB y actualiza los offsets
+    ; Initialize the B+ Tree for THIS specific shard
+    mov rdi, rbx                ; RDI = Base pointer (mmap) of the current Shard
+    call btree_init             ; Bootstraps the root node and updates offsets
     jmp .cleanup_fd
 
 .existing_db:

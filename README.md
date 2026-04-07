@@ -227,31 +227,35 @@ Instead of a single monolithic file, the engine implements a **Deterministic Sha
 
 ---
 
-#### 🔍 Search & Indexing
-By partitioning the data, the **Binary Search** algorithm operates only on the relevant 64MB segment.
+#### 🔍 Search & Indexing (B+ Tree)
+By partitioning the data across 27 files, the engine isolates the search domain. Within each shard, it employs a custom **B+ Tree with Linked Leaves**.
 
-* **Algorithm**: Binary Search within the targeted shard.
-* **Efficiency**: Any key among the 65,535 possible slots per shard is found or rejected in a maximum of **16 comparisons**.
-* **Memory Locality**: Sharding improves CPU cache hits by keeping relevant key-groups within the same memory-mapped page.
+* **Algorithm**: B+ Tree traversal for exact matches ($O(\log N)$) and Linked List harvesting for range scans ($O(\log N + K)$).
+* **Efficiency**: Using 256KB Mega-Pages, a shard containing tens of thousands of records requires a maximum of **2 pointer jumps** to resolve any physical address.
+* **Range Scan Supremacy**: The `SCAN` endpoint doesn't traverse the tree for every key. It finds the first matching leaf and follows the `NODE_OFFSET_NEXT` pointer to sweep contiguous memory blocks at RAM speed.
 
 ---
 
 #### 🛠️ Data Lifecycle (CRUD)
 
 1. **Insertion (POST)**:
-- Finds the correct alphabetical position via binary search.
-- If a new slot is needed, it uses the `std` (Set Direction Flag) and `rep movsq` instructions to shift existing data blocks down, creating an atomic-like "hole" for the new entry.
-- Increments the `TotalKeyCount` in the header and appends the operation to the WAL.
+    - **Append-Only Data**: The new 1KB data slot is safely appended to the end of the physical file using a lightning-fast Bump Allocator.
+    - **Index Update**: The key and the 8-byte absolute memory pointer are inserted into the **B+ Tree Index**. If the key already exists, the engine performs an $O(1)$ **In-Place Pointer Swap**, overwriting the old pointer without moving data.
+    - **Mega-Page Splitting**: If a 256KB leaf node reaches its 6,553 key limit, the engine performs a 2-Level split to maintain $O(\log N)$ traversal depth.
 
 2. **Retrieval (GET)**:
-- Sanitizes the URI and isolates the key.
-- Executes the binary search against the data slots (skipping the header).
-- Reads the exact binary length from the 2-byte Length prefix to construct the `Content-Length` header, enabling Binary-Safe transfers.
+    - Sanitizes the URI and isolates the key.
+    - Navigates the B+ Tree directory to find the correct 256KB Leaf Node.
+    - Performs an exact match to extract the 8-byte pointer, resolving the exact physical memory address of the Data Slot.
+    - Reads the exact binary length from the 2-byte Length prefix to construct the `Content-Length` header for Binary-Safe transfers.
 
-3. **Deletion (DELETE)**:
-- Locates the key.
-- "Collapses" the gap by shifting all subsequent blocks up by 1024 bytes.
-- Decrements the `TotalKeyCount` and logs the deletion to the WAL.
+3. **Range Scans (SCAN)**:
+    - Locates the starting leaf node via B+ Tree search.
+    - Harvests keys sequentially. When a leaf is exhausted, it follows the `NODE_OFFSET_NEXT` pointer directly to the next 256KB Mega-Page (Linked List traversal), avoiding full-tree re-evaluations.
+
+4. **Deletion (DELETE)**:
+    - Locates the key in the B+ Tree and removes it using a highly optimized, intra-node `rep movsb` shift.
+    - Decrements the `TotalKeyCount` and logs the deletion to the WAL. The physical Data Slot is orphaned (Lazy Deletion) to prioritize $O(1)$ throughput over disk footprint.
 
 ---
 
@@ -324,33 +328,6 @@ ls -lh db/a.db
 By default, the Linux Kernel uses a "write-back" cache strategy for memory-mapped files, which means physical commits to the SSD/HDD might be delayed. To guarantee **ACID-like Durability** and survive sudden power losses, the engine implements a synchronous **Write-Ahead Log (WAL)**.
 
 Every mutation is serialized to a persistent log (`wal.log`) *before* the memory-mapped B-Tree is modified in RAM.
-
-### 📂 Database File Internals (Multi-Shard)
-
-The engine manages an internal array of pointers (`db_ptrs`) pointing to 27 independent memory-mapped segments. Each shard is a binary file of exactly **67,108,864 bytes (64MB)**.
-
-
-
-| Offset (Hex) | Offset (Dec) | Size | Content | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `0x00000` | 0 | 8 B | **TotalKeyCount** | `uint64` (Little Endian) tracking active records. |
-| `0x00008` | 8 | 248 B | **Reserved** | Padding for future metadata expansion. |
-| `0x00100` | 256 | 1024 B | **Slot 0** | The first alphabetically sorted record. |
-| `0x00500` | 1280 | 1024 B | **Slot 1** | Start of the second key-value pair. |
-| ... | ... | ... | ... | ... |
-| `0x3FFF700` | 67,107,840 | 1024 B | **Slot 65535** | Final available slot before the 64MB boundary. |
-
-#### 🧮 Address Calculation
-The engine resolves any record's position in $O(1)$ using the following formula:
-
-$$Address(index) = BaseAddress + 256 + (index \times 1024)$$
-
-#### 🛠️ Technical Implementation & Hardware Commit
-The engine invokes the `sys_fdatasync` (ID 75) syscall immediately after every log entry append:
-
-* **Syscall**: `sys_fdatasync` (RAX: 75)
-* **Behavior**: This forces the CPU to block until the storage controller acknowledges that the data is physically committed to the non-volatile medium. The HTTP `200 OK` response is only sent to the client once the data is "on the metal."
-
 
 ---
 
@@ -677,39 +654,43 @@ The entire application runs in a **Scratch** Docker image, meaning there is no o
 
 ---
 
-## 📂 Memory Layout & Shard Internals
+### 📂 Memory Layout & Shard Internals
 
-"La Roca" handles data with surgical precision. Every byte in the 27 database shards is deterministically placed, allowing for $O(1)$ addressing without any overhead or metadata parsing during search operations.
+"La Roca" handles data with surgical precision. It implements a true **Index/Data Separation Architecture**. Every byte in the 27 database shards is deterministically placed, allowing for extreme caching locality and hardware-level speed.
 
+#### 🏗️ Shard Structure (64MB Files)
+Each shard file (`db/a.db` through `db/misc.db`) is pre-allocated to exactly 67,108,864 bytes. Memory is divided into a strict Metadata Header, followed by a dynamic mixture of B+ Tree Nodes and Data Slots managed by an internal Bump Allocator.
 
+**1. The Shard Header (256 Bytes)**
+The first page of every shard is locked for geometry and state tracking.
 
-### 🏗️ Shard Structure (64MB Files)
-Each shard file (`db/a.db` through `db/misc.db`) is pre-allocated to exactly 67,108,864 bytes.
+| Offset (Hex) | Offset (Dec) | Size | Content | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x00000` | 0 | 8 B | **TotalKeyCount** | Atomic `uint64` (Little Endian) tracking active records. |
+| `0x00008` | 8 | 8 B | **Slot Size** | Locked geometry: Disk authority for max slot capacity. |
+| `0x00010` | 16 | 8 B | **Root Offset** | Absolute pointer to the root node of the B+ Tree. |
+| `0x00018` | 24 | 8 B | **Allocator Ptr** | `Next Free Pointer` tracking the tail of the shard. |
+| `0x00020` | 32 | 8 B | **Key Size** | Locked geometry: Disk authority for max key length. |
 
-| Offset (Hex) | Size | Name | Description |
-| :--- | :--- | :--- | :--- |
-| `0x00000` | 8 B | **TotalKeyCount** | Atomic `uint64` (Little Endian) counter. |
-| `0x00008` | 248 B | **Header Padding** | Reserved for future metadata (versioning, flags). |
-| `0x00100` | 1024 B | **Slot 0** | The first data record. |
-| `0x00500` | 1024 B | **Slot 1** | The second data record. |
-| `...` | `...` | `...` | `...` |
-| `0x3FFF700` | 1024 B | **Slot 65534** | Final slot before the 64MB boundary. |
+**2. The Index Space: Mega-Pages (256KB)**
+To minimize CPU Cache misses during tree traversal, "La Roca" uses massive 256KB B+ Tree nodes instead of standard 4KB pages. A single node can hold up to **6,553 keys**, meaning millions of records can be accessed in just 2 memory jumps.
+* **Layout**: `[Type: 1B] | [KeyCount: 2B] | [ParentPtr: 8B] | [NextLeafPtr: 8B] | [Key1] [Ptr1] ...`
 
----
-
-### 📦 Data Slot Format (The 1KB Block)
-Every key-value pair occupies exactly **1024 bytes (1KB)**. This alignment ensures that records never straddle memory pages or disk sectors unnecessarily.
+**3. The Data Space: Data Slots (1KB)**
+Records are stored sequentially in an append-only fashion. Every key-value pair occupies exactly **1024 bytes (1KB)**.
 
 | Offset (Inside Slot) | Size | Content | Technical Detail |
 | :--- | :--- | :--- | :--- |
 | `+0` | 32 B | **Key** | Raw ASCII/Binary key (null-padded). |
 | `+32` | 2 B | **Length** | `uint16` storing the exact payload size (0-989). |
-| `+34` | 1 B | **Status/Type** | `0x01` for Active, `0x00` for Empty/Deleted. |
+| `+34` | 1 B | **Status/Type** | `0x01` for Active. |
 | `+35` | 989 B | **Value** | Raw binary payload (Binary-Safe). |
 
-**Addressing Formula:**
-To find the start of any record by its index:
-$$Address(index) = BaseAddress + 256 + (index \times 1024)$$
+#### 🧮 How Addressing Works Now
+Unlike standard flat-array databases, you cannot guess a record's physical address by its alphabetical index.
+1. The engine reads the **Root Offset** (`+16`) from the Shard Header.
+2. It traverses the **B+ Tree** in $O(\log N)$ time.
+3. The tree yields an 8-byte pointer resolving the exact, absolute memory address of the **Data Slot**.
 
 ---
 

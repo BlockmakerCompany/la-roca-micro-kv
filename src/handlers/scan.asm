@@ -65,26 +65,26 @@ handle_scan:
     lea rsi, [q_prefix]
 .do_jump:
     mov rdi, r12
-    call btree_search           ; RAX = Offset del Nodo Hoja (Leaf)
+    call btree_search           ; RAX = Offset of the Leaf Node
     test rax, rax
     jz .err_not_found
-    lea r13, [r12 + rax]        ; R13 = Dirección Física del Nodo Hoja
+    lea r13, [r12 + rax]        ; R13 = Physical Address of the Leaf Node
 
     ; --- 3. INTRA-LEAF START INDEX ---
-    xor r8, r8                  ; R8 = Índice actual
-    movzx r9, word [r13 + 1]    ; R9 = Total de llaves en la hoja
+    xor r8, r8                  ; R8 = Current index
+    movzx r9, word [r13 + 1]    ; R9 = Total keys in the leaf
 .find_start_idx:
     cmp r8, r9
-    je .start_harvest           ; Si no, cosechamos en la próxima hoja
+    je .start_harvest           ; If not found, start harvesting in the next leaf
 
     mov rax, r8
     imul rax, 40                ; ENTRY_SIZE
     lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey
 
-    ; RSI ya tiene la Search Key preservada
+    ; RSI already contains the preserved Search Key
     call compare_keys
 
-    ; 🛡️ CRITICAL FIX: jbe (Jump if Below or Equal) atrapará CF=1 o ZF=1
+    ; 🛡️ CRITICAL FIX: jbe (Jump if Below or Equal) catches CF=1 or ZF=1
     jbe .start_harvest
 
     inc r8
@@ -106,15 +106,15 @@ handle_scan:
     mov r15d, 50                ; Default limit
 
 .leaf_loop:
-    movzx r9, word [r13 + 1]    ; R9 = Total llaves en la hoja actual
+    movzx r9, word [r13 + 1]    ; R9 = Total keys in current leaf
 
 .key_loop:
     cmp r8, r9
-    jae .next_leaf              ; Si se acabaron las llaves, saltar a la próxima
+    jae .next_leaf              ; If keys are exhausted, jump to the next leaf
 
     mov rax, r8
     imul rax, 40
-    lea rbx, [r13 + 19 + rax]   ; RBX = Pointer a la llave actual
+    lea rbx, [r13 + 19 + rax]   ; RBX = Pointer to the current key
 
     ; --- TELEMETRY (STDOUT) ---
     mov rax, 1
@@ -136,7 +136,7 @@ handle_scan:
     mov rdi, rbx
     call .check_prefix
     test rax, rax
-    jz .finish_with_close       ; Prefix mismatch -> Terminar paginación
+    jz .finish_with_close       ; Prefix mismatch -> Terminate pagination
 
     ; --- DISPATCH KEY ---
     call .send_trimmed_key
@@ -150,12 +150,12 @@ handle_scan:
     jmp .key_loop
 
 .next_leaf:
-    mov rax, [r13 + 11]         ; Leer NODE_OFFSET_NEXT
+    mov rax, [r13 + 11]         ; Read NODE_OFFSET_NEXT
     test rax, rax
-    jz .finish_with_close       ; Si es 0, fin del Shard
+    jz .finish_with_close       ; If 0, end of Shard reached
 
-    lea r13, [r12 + rax]        ; R13 = Dirección de la nueva hoja
-    xor r8, r8                  ; Reiniciar índice
+    lea r13, [r12 + rax]        ; R13 = Address of the new leaf
+    xor r8, r8                  ; Reset index
     jmp .leaf_loop
 
 .finish_with_close:
