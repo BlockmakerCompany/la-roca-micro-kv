@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # Script: tests/test_security.sh
 # Project: La Roca Micro-KV
-# Responsibility: Hardening & Protocol Boundary Validation.
+# Responsibility: Hardening & Protocol Boundary Validation (Keep-Alive Compatible).
 # -----------------------------------------------------------------------------
 
 GREEN='\033[0;32m'
@@ -54,30 +54,36 @@ check_result "$CODE" "400" "Rejection of zero-length body (400)"
 echo -e "\n${YELLOW}S2. Header & Memory Protection${NC}"
 
 # Test: Header Scan Limit
-GARBAGE_HEADERS=$(printf 'X-Garbage: abc\r\n%.0s' {1..100})
+GARBAGE_HEADERS=$(printf 'X-Garbage: abc\r\n%.0s' {1..400})
 CODE=$(echo -e "POST /keys/limit HTTP/1.1\r\n${GARBAGE_HEADERS}\r\n" | nc -w 1 localhost 8080 | grep "HTTP/1.1" | awk '{print $2}')
 check_result "$CODE" "411" "Header scan limit enforced at 1KB (411 fallback)"
 
 
-# --- S3. Connection & Smuggling Protection ---
-echo -e "\n${YELLOW}S3. Connection & Smuggling Protection${NC}"
+# --- S3. Connection & Persistency Validation ---
+echo -e "\n${YELLOW}S3. Connection & Persistency Validation${NC}"
 
-# Test: Connection Closure Enforcement
-# Usamos -v para capturar los headers que curl escupe a stderr (2>&1)
-HEADER_CLOSE=$(curl -s -v -X POST "$DATA_URL/close_test" -d "data" 2>&1 | grep -i "< Connection:" | awk '{print $3}' | tr -d '\r')
+# Test A: Happy Path -> The engine MUST offer Keep-Alive
+# Send a valid POST request and capture the header.
+HEADER_KA=$(curl -s -v -X POST "$DATA_URL/ka_test" -d "data" 2>&1 | grep -i "< Connection:" | awk '{print $3}' | tr -d '\r')
 
-# Si por el cierre agresivo curl no lo pesca en la linea estándar, probamos con el dump
-if [ -z "$HEADER_CLOSE" ]; then
-    HEADER_CLOSE=$(curl -s -I -X POST "$DATA_URL/close_test" -d "data" | grep -i "Connection:" | awk '{print $2}' | tr -d '\r')
+if [ -z "$HEADER_KA" ]; then
+    # Fallback in case curl doesn't spit it out to stderr
+    HEADER_KA=$(curl -s -i -X POST "$DATA_URL/ka_test" -d "data" | grep -i "Connection:" | awk '{print $2}' | tr -d '\r')
 fi
 
-check_result "$HEADER_CLOSE" "close" "Connection: close header present"
+check_result "$HEADER_KA" "keep-alive" "Success responses offer Keep-Alive"
+
+# Test B: Error Path -> The engine MUST force closure for security (Guillotine)
+# Force a 411 Error (Missing Content-Length) by sending a raw request with nc.
+HEADER_ERR_CLOSE=$(echo -e "POST /keys/err_close HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc -w 1 localhost 8080 | grep -i "Connection:" | awk '{print $2}' | tr -d '\r')
+
+check_result "$HEADER_ERR_CLOSE" "close" "Error responses still enforce Connection: close"
 
 
 # --- S4. URI Path Traversal / Sanitization ---
 echo -e "\n${YELLOW}S4. URI Path Sanitization${NC}"
 
-# Test: Path Traversal attempt (FORZAMOS que curl no normalice la ruta)
+# Test: Path Traversal attempt
 CODE=$(curl -s -o /dev/null -w "%{http_code}" --path-as-is "$API_URL/keys/../stats")
 check_result "$CODE" "404" "Rejection of path traversal (..)"
 

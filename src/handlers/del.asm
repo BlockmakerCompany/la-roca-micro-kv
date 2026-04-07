@@ -3,7 +3,7 @@
 ; Project: La Roca Micro-KV
 ; Responsibility: Logic for HTTP DELETE operations.
 ;                 Implements WAL logging, B-Tree gap-collapse deletion,
-;                 and mandatory socket closure for security.
+;                 and supports HTTP Keep-Alive on success.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 %include "responses.inc"     ; Centralized headers and lengths (removes Linker ambiguity)
@@ -55,13 +55,12 @@ handle_del:
     ; 4. Success Response (200 OK)
     mov rax, 1                  ; sys_write
     mov rdi, r13
-    lea rsi, [hdr_200_del]      ; Resolved locally via responses.inc
+    lea rsi, [hdr_200_del]      ; Must include "Connection: keep-alive" in responses.inc
     mov rdx, len_200_del
     syscall
 
-    ; 5. Mandatory Hygiene: Explicitly close the socket
-    mov rdi, r13
-    call close_socket
+    ; 🛡️ CRITICAL FIX: Do NOT close socket here.
+    ; Return cleanly to main loop for Keep-Alive.
     jmp .finish
 
 .err_411_miss:

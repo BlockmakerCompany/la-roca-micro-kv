@@ -3,7 +3,7 @@
 ; Project: La Roca Micro-KV
 ; Responsibility: Hardened, binary-safe POST/SET handling.
 ;                 Implements strict Content-Length validation, 411/413 error
-;                 handling, and mandatory socket closure for security.
+;                 handling, and supports HTTP Keep-Alive on success.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 %include "responses.inc"
@@ -36,7 +36,7 @@ extern validated_key
 extern rt_val_max_size
 
 section .bss
-    tmp_val    resb 2048
+    tmp_val    resb 8192
     tmp_v_len  resw 1
 
 section .text
@@ -59,7 +59,7 @@ handle_set:
     ; 1. Buffer Sanitization
     lea rdi, [tmp_val]
     xor al, al
-    mov rcx, 2048
+    mov rcx, 8192
     cld
     rep stosb
 
@@ -76,7 +76,7 @@ handle_set:
     jz .err_411
     mov rbx, rsi
     sub rbx, r14
-    cmp rbx, 1024
+    cmp rbx, 4096
     ja .err_411
     jmp .find_cl
 
@@ -161,10 +161,12 @@ handle_set:
 
     mov rax, 1
     mov rdi, r13
-    lea rsi, [hdr_200_stored]
+    lea rsi, [hdr_200_stored]   ; Must include "Connection: keep-alive" in responses.inc
     mov rdx, len_200_stored
     syscall
-    jmp .finish_with_close
+
+    ; 🛡️ CRITICAL FIX: Bypass the sys_close block on success
+    jmp .finish_with_keepalive
 
 ; --- Error Handlers ---
 
@@ -197,6 +199,10 @@ handle_set:
     mov rdi, r13
     call handle_507
     jmp .finish_with_close
+
+.finish_with_keepalive:
+    DEBUG_LOG "Keeping client socket open for Keep-Alive."
+    jmp .finish
 
 .finish_with_close:
     DEBUG_LOG "Closing client socket."

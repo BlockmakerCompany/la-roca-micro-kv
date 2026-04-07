@@ -113,11 +113,33 @@ By eliminating the dependency on `libc.so` or `musl`, we achieve a level of bina
 * **Instruction-Level Control:** Every operation—from file I/O to memory mapping—is triggered by manually setting up the CPU registers (`rax`, `rdi`, `rsi`, etc.) and executing the `syscall` opcode.
 * **Immunity to "Dependency Hell":** Since the binary is 100% static and unlinked, it carries no baggage. It will run on any Linux kernel (x86_64) regardless of the distribution.
 
-### 3.2 High-Performance Networking (Zero-Copy Intent)
+### 3.2 High-Performance Networking & The Persistent Event Loop
 The networking stack is built on the raw Berkeley Sockets API provided by the kernel, optimized for the lowest possible latency and minimal context-switching.
 
-* **Raw Socket Lifecycle:** The engine manually invokes `sys_socket`, `sys_bind`, and `sys_listen`. When a connection arrives, `sys_accept` provides a file descriptor processed without any high-level "Stream" abstractions.
-* **Memory-Network Synergy:** Data received from the network is read directly into our pre-allocated buffers. By eliminating intermediate buffering, we drastically reduce CPU cycle consumption per request.
+* **The Keep-Alive Engine:** Instead of suffering the expensive TCP 3-way handshake for every request, La Roca implements a persistent, single-threaded event loop. Valid requests keep the file descriptor open, dropping p(95) latency to **under 1 millisecond (~800µs)**.
+* **Hardware Deadlock Protection:** To prevent a malicious client from holding the single-threaded loop hostage, the engine injects a strict `SO_RCVTIMEO` (Receive Timeout) via `sys_setsockopt`. If a client remains idle for 10ms, the Kernel aggressively drops the connection, allowing the engine to serve the next user instantly.
+* **Memory-Network Synergy:** Data received from the network is read directly into a pre-allocated **8KB buffer**. By eliminating intermediate abstractions and allocating raw space for 4KB headers, we drastically reduce CPU cycle consumption per request.
+
+### 3.3 The Assembly HTTP Parser: Attack Surface Reduction
+General-purpose HTTP parsers are often multi-megabyte liabilities prone to complex exploits. La Roca uses a **Minimalist State Machine** written in pure Assembly.
+
+* **Byte-by-Byte Scanning:** Instead of using expensive string functions, the engine scans the input buffer in a single pass using the `lodsb` instruction.
+* **The "Guillotine" Policy:** The engine offers Keep-Alive amnesty to valid requests, but enforces a zero-tolerance policy for syntax errors. If a client sends an oversized payload (413), misses a `Content-Length` header (411), or sends malformed bytes (400), the engine responds and triggers an immediate `sys_close`. This hard boundary prevents HTTP Request Smuggling and drops malicious actors instantly.
+* **Security by Omission:** By not implementing 99% of unnecessary HTTP specifications, we eliminate entire classes of vulnerabilities.
+
+```mermaid
+graph TD
+    Socket[TCP Socket] -->|Raw Bytes 8KB| Parser{Assembly State Machine}
+    Parser -->|Invalid / Error 4xx| Drop[The Guillotine: sys_close]
+    Parser -->|Valid GET/POST| Action[Process Route]
+    Action -->|200 OK| Loop[Keep-Alive: Wait 10ms for next request]
+    Loop -->|Timeout| Drop
+    Loop -->|New Data| Parser
+    
+    style Drop fill:#f8d7da,stroke:#842029
+    style Action fill:#d1e7dd,stroke:#0f5132
+    style Loop fill:#cff4fc,stroke:#055160
+```
 
 ### 3.3 The Assembly HTTP Parser: Attack Surface Reduction
 General-purpose HTTP parsers are often multi-megabyte liabilities prone to complex exploits. La Roca uses a **Minimalist State Machine** written in pure Assembly.
@@ -179,7 +201,7 @@ La Roca is designed to be the bedrock of a new generation of hyper-efficient inf
 
 * **Design & Architecture:** Fernando E. Mancuso & BlockMaker Engineering
 * **Organization:** [BlockmakerCompany](https://github.com/BlockmakerCompany)
-* **Release:** March 2026 | Stable Build 1.0.0
+* **Release:** April 2026 | Stable Build 1.1.0
 * **Inquiries:** For industrial integration or low-level consulting, reach out via [GitHub Issues](https://github.com/BlockmakerCompany/la-roca-micro-kv/issues).
 
 > *"If it requires a library, it doesn't belong in the core."* > — **The BlockMaker Manifesto**

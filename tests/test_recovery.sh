@@ -10,7 +10,7 @@
 
 # --- Environment Pre-flight ---
 PORT=8085
-IMAGE_NAME="micro-kv-asm:1.0.0"
+IMAGE_NAME="blockmaker/la-roca-kv:1.1.0"
 
 # Persistent volume for real disk I/O testing
 TEST_DIR="$(pwd)/asm_kv_recovery_test_$$"

@@ -10,7 +10,7 @@
 
 # --- Environment Pre-flight ---
 PORT=8086
-IMAGE_NAME="micro-kv-asm:1.0.0"
+IMAGE_NAME="blockmaker/la-roca-kv:1.1.0"
 
 TEST_DIR="$(pwd)/asm_kv_config_test_$$"
 # Keys for testing (Note: No leading slash here, handled by the API path)

@@ -2,7 +2,7 @@
 ; Module: src/handlers/get.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: High-performance Zero-Copy Data Retrieval (Dynamic Geometry).
-;                 Enforces socket closure after transmission to prevent leaks.
+;                 Supports HTTP Keep-Alive (Does NOT close the socket on success).
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 %include "responses.inc" ; <--- Resolves hdr_200_dyn, hdr_crlf_crlf locally
@@ -73,7 +73,7 @@ handle_get:
 
     ; --- 4. HTTP RESPONSE CHAIN ---
 
-    ; A. Static Headers (Connection: close included)
+    ; A. Static Headers (Connection: keep-alive included in responses.inc)
     mov rax, 1
     mov rdi, r13
     lea rsi, [hdr_200_dyn]
@@ -96,7 +96,7 @@ handle_get:
 
     ; D. Zero-Copy Body Transmission
     test r14, r14
-    jz .finish_with_close
+    jz .finish_with_keepalive
 
     mov rax, 1
     mov rdi, r13
@@ -104,14 +104,13 @@ handle_get:
     mov rdx, r14
     syscall
 
-.finish_with_close:
-    ; Mandatory Hygiene: Close socket to signal EOF and drain buffers.
-    mov rdi, r13
-    call close_socket
+.finish_with_keepalive:
+    ; 🛡️ CRITICAL FIX: Do NOT call close_socket here.
+    ; We return cleanly to the main loop to serve the next request on this FD.
     jmp .finish
 
 .err_404:
-    ; Key-miss: handle_404 responds and closes the socket.
+    ; Key-miss: handle_404 responds and closes the socket (Fail-Fast).
     mov rdi, r13
     call handle_404
 

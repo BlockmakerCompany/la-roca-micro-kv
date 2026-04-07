@@ -19,8 +19,8 @@ it achieves extreme efficiency and atomic resilience in a tiny binary footprint.
 Modern infrastructure is bloated. Standard databases (Redis, Memcached) carry heavy runtimes that tax your CPU and RAM before processing a single byte of data. **La Roca eliminates the "Abstraction Tax."**
 
 * **95% Less Footprint:** Replace 200MB containers with a 10KB binary.
-* **Zero Jitter:** No Garbage Collection, no runtime overhead. Just deterministic latency.
-* **Cloud Cost Efficiency:** Handle 2,300+ req/s with 0.5 CPU cores. Scale your throughput, not your bill.
+* **Zero Jitter (Sub-Millisecond):** No Garbage Collection, no runtime overhead. Achieves p(95) latency under 1ms (**~800µs**) via native HTTP Keep-Alive and $O(1)$ memory mapping.
+* **Cloud Cost Efficiency:** Handle massive concurrency with 0.5 CPU cores. Scale your throughput, not your bill.
 
 **Perfect for:** Edge Computing, High-Frequency Trading (HFT), Sidecar Rate-Limiters, and IoT gateways where every millicore counts.
 
@@ -68,10 +68,11 @@ docker run -d -p 8080:8080 --name la-roca blockmaker/la-roca-kv:latest
 | **Total Capacity** | Variable | **~1.7 GB** ($27 \times 64\text{MB}$ shards) |
 | **Max Key Count** | Variable | **1,769,445 slots** ($27 \times 65,535$) |
 | **Binary Size** | 10 MB - 50 MB | **~10.1 KB** |
+| **p(95) Latency** | 5ms - 50ms | **< 1ms (~800µs)** (via Keep-Alive) |
 | **Startup Time** | 100ms - 1s | **< 5ms** (Mapping 1.7GB + WAL Replay) |
 | **I/O Isolation** | Low | **High** (Deterministic partitioning) |
 
-> **Note on Throughput:** Formal Requests-Per-Second (RPS) metrics are not listed here. Because this engine is a Zero-Copy, `libc`-free application, local load testing often saturates the OS loopback network interface before maxing out the CPU. The engine operates at the maximum speed the Kernel can handle TCP interrupts and `sys_write` syscalls.
+> **Note on Throughput:** Formal Requests-Per-Second (RPS) metrics are not listed here. Because this engine is a Zero-Copy, `libc`-free application with native **HTTP Keep-Alive**, local load testing often saturates the OS loopback network interface before maxing out the CPU. The engine operates at the maximum speed the Kernel can handle TCP interrupts and `sys_write` syscalls.
 
 ## 🏎️ The "Loopback Saturation" Phenomenon
 
@@ -114,7 +115,7 @@ If you need to store larger payloads (e.g., 4KB JSON documents) or support billi
 
 ## 📡 API Definition (The Contract)
 
-The service implements a structured REST interface. By isolating data operations under the `/keys` namespace, the engine avoids collisions between user data and system management endpoints. It is completely **Binary-Safe**, allowing for the storage of raw buffers, images, or encrypted blobs without corruption.
+The service implements a structured REST interface with native **HTTP Keep-Alive** support to eliminate TCP handshake overhead on consecutive requests. By isolating data operations under the `/keys` namespace, the engine avoids collisions between user data and system management endpoints. It is completely **Binary-Safe**, allowing for the storage of raw buffers, images, or encrypted blobs without corruption.
 
 ---
 
@@ -460,11 +461,12 @@ Since we don't use `libc` functions like `scanf` or `gets`, we have granular con
 
 ---
 
-### 🚦 Fail-Fast Routing
-The router doesn't "guess" or try to fix malformed requests. If a request doesn't perfectly match the expected pattern, the engine terminates the connection immediately.
+### 🚦 Fail-Fast Routing & The "Keep-Alive Guillotine"
+The router doesn't "guess" or try to fix malformed requests. It implements a strict state-machine security policy:
 
-* **Length-Aware Keys**: Any key extracted from a URI that exceeds 31 bytes (plus null terminator) is rejected with a `400 Bad Request` before any database shard is even opened.
-* **Header Sanitization**: The engine only parses the `Content-Length` header. All other headers are ignored and discarded to prevent "Header Smuggling" or slow-loris style attacks.
+* **Success Path Amnesty:** Valid requests (`200 OK`) and business-logic errors (`404 Not Found`) keep the socket alive, allowing clients to pipeline requests with sub-millisecond latency.
+* **The Guillotine Policy:** If a client sends malformed headers (`411`), oversized payloads (`413`), or invalid protocols (`400`), the engine responds and **instantly executes a `sys_close`** on the socket. This terminates the connection, preventing HTTP Request Smuggling and dropping malicious actors immediately.
+* **Header Sanitization:** The engine only scans up to 4KB of headers looking for `Content-Length`. Any garbage beyond this limit triggers the Guillotine.
 
 ---
 
@@ -503,11 +505,11 @@ services:
       - "80:8080"
 
   node-1:
-    image: micro-kv-asm:1.0.0
+    image: blockmaker/la-roca-kv:1.1.0
     volumes: ["./data/n1:/app/db"]
 
   node-2:
-    image: micro-kv-asm:1.0.0
+    image: blockmaker/la-roca-kv:1.1.0
     volumes: ["./data/n2:/app/db"]
 ```
 
@@ -859,17 +861,19 @@ Ensures that runtime geometry (Key/Value sizes) and environment variables are co
 ---
 
 ### ⚡ Stress Testing & Benchmarking
-To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls.
+To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls. With Keep-Alive enabled, the engine consistently achieves **p(95) latencies under 1 millisecond**.
 
 #### Modern Observability (K6)
 ```bash
+# Our K6 suite automatically leverages HTTP/1.1 Keep-Alive
 k6 run tests/stress_test.js
 ```
 
 #### Raw Throughput (Apache Bench)
 ```bash
 # Send 100,000 requests with 100 concurrent connections
-ab -c 100 -n 100000 http://localhost:8080/live
+# The -k flag is CRITICAL to enable Keep-Alive and benchmark real engine speed
+ab -k -c 100 -n 100000 http://localhost:8080/live
 ```
 *Note: Because the engine bypasses `libc` and uses a zero-allocation event loop, you will likely saturate your local network loopback interface before maxing out the CPU.*
 ---

@@ -39,6 +39,10 @@ export default function () {
     const payload = "val";
 
     const params = {
+        headers: {
+            // Explicitly request Keep-Alive to test the Assembly scanner
+            'Connection': 'keep-alive',
+        },
         tags: {
             // Aggregate metrics under one name to save K6 memory
             name: 'PostToKeysNamespace'
