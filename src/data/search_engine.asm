@@ -2,7 +2,7 @@
 ; Module: src/data/search_engine.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: Dynamic Read-Only Logic. 
-;                 Implements Binary Search ($O(\log N)$) using runtime geometry.
+;                 Implements B+ Tree Search ($O(\log N)$) for exact matches.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
@@ -10,113 +10,67 @@
 extern rt_slot_size
 extern rt_key_size
 
+; --- External B+ Tree functions (from btree.asm) ---
+extern btree_search
+
+; --- Constants for B+ Tree Leaf Navigation ---
+%define NODE_OFFSET_KEYS     1
+%define HEADER_SIZE          19
+%define MAX_KEY_SIZE         32
+%define ENTRY_SIZE           40
+
 section .text
     global btree_find
-    global btree_find_lower_bound
     global compare_keys
 
 ; -----------------------------------------------------------------------------
-; btree_find_lower_bound: Finds the first index where ShardKey >= SearchKey.
-; -----------------------------------------------------------------------------
-btree_find_lower_bound:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    push r12
-    push r13
-    push r14
-
-    mov r8, rdi                 ; R8  = Shard Base Address
-    mov r11, qword [r8]         ; R11 = Current Key Count
-    mov r13, rsi                ; R13 = Search Key Pointer
-
-    xor r10, r10                ; R10 = Low (0)
-    mov r14, r11                ; R14 = Candidate (End)
-    dec r11                     ; R11 = High (Count - 1)
-
-    test r14, r14
-    jz .lb_done
-
-.lb_loop:
-    cmp r10, r11
-    jg .lb_done
-
-    ; Calculate Midpoint
-    mov rax, r10
-    add rax, r11
-    shr rax, 1
-    mov r9, rax                 ; R9 = Mid Index
-
-    ; --- DYNAMIC OFFSET CALCULATION ---
-    ; Calculate address: ShardBase + 256 + (Index * rt_slot_size)
-    mov rax, r9
-    mul qword [rt_slot_size]    ; RAX = Index * SLOT_SIZE
-    mov rbx, rax
-    lea r12, [r8 + 256 + rbx]   ; R12 = Pointer to Mid Slot
-
-    lea rdi, [r12]
-    mov rsi, r13
-    call compare_keys
-
-    ; Binary Search Decision
-    ja .go_right                ; SearchKey > ShardKey
-
-    mov r14, r9                 ; Candidate found
-    test r9, r9
-    jz .lb_done
-    mov r11, r9
-    dec r11
-    jmp .lb_loop
-
-.go_right:
-    mov r10, r9
-    inc r10
-    jmp .lb_loop
-
-.lb_done:
-    mov rax, r14
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    leave
-    ret
-
-; -----------------------------------------------------------------------------
-; btree_find: Exact match lookup.
+; btree_find: Exact match lookup using B+ Tree index.
+; Input:  RDI = Shard Base Address
+;         RSI = Search Key Pointer
+; Output: RAX = Pointer to Data Value Slot (or 0 if not found)
 ; -----------------------------------------------------------------------------
 btree_find:
     push rbp
     mov rbp, rsp
-    push rsi
-    push rdi
+    push rbx
+    push r12
 
-    call btree_find_lower_bound
-    mov r9, rax
+    mov r12, rdi            ; Save Shard Base Pointer
 
-    pop rdi                     ; RDI = Shard Base
-    pop rsi                     ; RSI = Search Key
+    ; 1. Find the target Leaf Node (calls btree_search in btree.asm)
+    call btree_search       ; RAX = Offset of the Leaf Node
+    lea rbx, [r12 + rax]    ; RBX = Physical address of the Leaf
 
-    cmp r9, [rdi]
-    jae .not_found
+    ; 2. Linear search within the Leaf Node
+    movzx rcx, word [rbx + NODE_OFFSET_KEYS]
+    xor r9, r9
+.find_key:
+    cmp r9, rcx
+    je .not_found
 
-    ; --- DYNAMIC OFFSET CALCULATION ---
+    ; Calculate pointer to current key in the leaf
     mov rax, r9
-    mul qword [rt_slot_size]
-    lea r12, [rdi + 256 + rax]
+    imul rax, ENTRY_SIZE
+    lea rdi, [rbx + HEADER_SIZE + rax]
 
-    push rdi
-    lea rdi, [r12]
+    ; Compare Keys (compare_keys safely preserves RDI/RSI)
     call compare_keys
-    pop rdi
-    jne .not_found
+    je .found_it            ; Exact key match found!
 
-    mov rax, r12
-    jmp .exit
+    inc r9
+    jmp .find_key
+
+.found_it:
+    ; Extract the 8-byte pointer attached to the key
+    mov rax, [rdi + MAX_KEY_SIZE]
+    add rax, r12            ; Add Shard Base (Final physical memory address)
+    jmp .exit_get
 
 .not_found:
-    xor rax, rax
-.exit:
+    xor rax, rax            ; Return 0 (Not Found)
+.exit_get:
+    pop r12
+    pop rbx
     leave
     ret
 

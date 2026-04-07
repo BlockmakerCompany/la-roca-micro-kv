@@ -12,6 +12,7 @@ extern rt_key_size
 extern rt_slot_size
 extern rt_slots_per_shard
 extern recalc_offsets           ; From config_runtime.asm
+extern btree_init
 
 section .data
     db_dir       db "db", 0
@@ -146,6 +147,18 @@ init_storage:
     mov qword [rbx + 8], r15
     mov r15, [rt_key_size]
     mov qword [rbx + 32], r15
+
+    ; =========================================================================
+    ; 🌳 B+ TREE INIT (Per-Shard Geometry)
+    ; Offset 16 = Root Pointer
+    ; Offset 24 = Next Free Pointer (Allocator)
+    ; =========================================================================
+    mov qword [rbx + 16], 0     ; 0 significa que aún no hay nodo raíz
+    mov qword [rbx + 24], 256   ; La memoria libre arranca justo después del Header
+
+    ; Llamar a inicializar el árbol para ESTE shard específico
+    mov rdi, rbx                ; RDI = Puntero base (mmap) del Shard actual
+    call btree_init             ; Crea el nodo raíz de 4KB y actualiza los offsets
     jmp .cleanup_fd
 
 .existing_db:

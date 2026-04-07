@@ -2,16 +2,17 @@
 ; Module: src/handlers/scan.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: Dynamic Range Scan Handler with Trace Logging.
+;                 Navigates the B+ Tree Leaf Linked List for extreme efficiency.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 %include "responses.inc"
 
 ; --- External Dependencies ---
-extern btree_find_lower_bound
+extern btree_search
+extern compare_keys
 extern get_shard_ptr
 extern handle_400, handle_404, close_socket
 extern q_prefix, q_startkey, q_limit
-extern rt_slot_size, rt_offset_type
 extern parse_query_params
 
 section .data
@@ -48,7 +49,7 @@ handle_scan:
 
     call parse_query_params
 
-    ; --- 2. BINARY JUMP ---
+    ; --- 2. B+ TREE LEAF JUMP ---
     lea rsi, [q_prefix]
     cmp byte [rsi], 0
     je .err_bad_req
@@ -64,88 +65,112 @@ handle_scan:
     lea rsi, [q_prefix]
 .do_jump:
     mov rdi, r12
-    call btree_find_lower_bound
-    mov r13, rax                ; R13 = Starting Index (i)
+    call btree_search           ; RAX = Offset del Nodo Hoja (Leaf)
+    test rax, rax
+    jz .err_not_found
+    lea r13, [r12 + rax]        ; R13 = Dirección Física del Nodo Hoja
 
-    ; --- 3. SEND HTTP HEADERS ---
+    ; --- 3. INTRA-LEAF START INDEX ---
+    xor r8, r8                  ; R8 = Índice actual
+    movzx r9, word [r13 + 1]    ; R9 = Total de llaves en la hoja
+.find_start_idx:
+    cmp r8, r9
+    je .start_harvest           ; Si no, cosechamos en la próxima hoja
+
+    mov rax, r8
+    imul rax, 40                ; ENTRY_SIZE
+    lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey
+
+    ; RSI ya tiene la Search Key preservada
+    call compare_keys
+
+    ; 🛡️ CRITICAL FIX: jbe (Jump if Below or Equal) atrapará CF=1 o ZF=1
+    jbe .start_harvest
+
+    inc r8
+    jmp .find_start_idx
+
+.start_harvest:
+    ; --- 4. SEND HTTP HEADERS ---
     mov rax, 1
     mov rdi, [rbp-8]
-    lea rsi, [hdr_scan_ok]      ; From responses.inc
+    lea rsi, [hdr_scan_ok]
     mov rdx, len_scan_ok
     syscall
 
-    ; --- 4. HARVEST LOOP ---
+    ; --- 5. HARVEST LOOP (B+ Tree Linked List) ---
     xor r14, r14                ; R14 = Results counter
     mov r15d, [q_limit]
     test r15d, r15d
-    jnz .loop
+    jnz .leaf_loop
     mov r15d, 50                ; Default limit
 
-.loop:
-    cmp r14, r15
-    jae .finish_with_close
-    mov rax, [r12]              ; Total keys in shard
-    cmp r13, rax
-    jae .finish_with_close
+.leaf_loop:
+    movzx r9, word [r13 + 1]    ; R9 = Total llaves en la hoja actual
 
-    ; DYNAMIC OFFSET CALCULATION
-    mov rax, r13
-    xor rdx, rdx
-    mul qword [rt_slot_size]
-    lea rbx, [r12 + 256 + rax]  ; RBX = Pointer to current slot
+.key_loop:
+    cmp r8, r9
+    jae .next_leaf              ; Si se acabaron las llaves, saltar a la próxima
+
+    mov rax, r8
+    imul rax, 40
+    lea rbx, [r13 + 19 + rax]   ; RBX = Pointer a la llave actual
 
     ; --- TELEMETRY (STDOUT) ---
-    push rax
-    push rdi
     mov rax, 1
-    mov rdi, 1                  ; Docker Logs
+    mov rdi, 1
     lea rsi, [msg_trace]
     mov rdx, len_trace
     syscall
     mov rax, 1
-    mov rsi, rbx                ; Key
+    mov rsi, rbx
     mov rdx, 32
     syscall
     mov rax, 1
     lea rsi, [newline]
     mov rdx, 1
     syscall
-    pop rdi
-    pop rax
 
     ; --- PREFIX VALIDATION ---
     lea rsi, [q_prefix]
     mov rdi, rbx
     call .check_prefix
     test rax, rax
-    jz .finish_with_close       ; Prefix mismatch -> Ordered break
-
-    ; --- STATUS CHECK ---
-    mov rdx, [rt_offset_type]
-    cmp byte [rbx + rdx], 1     ; Active record?
-    jne .next
+    jz .finish_with_close       ; Prefix mismatch -> Terminar paginación
 
     ; --- DISPATCH KEY ---
     call .send_trimmed_key
     inc r14
 
-.next:
-    inc r13
-    jmp .loop
+    ; --- LIMIT CHECK ---
+    cmp r14, r15
+    jae .finish_with_close
+
+    inc r8
+    jmp .key_loop
+
+.next_leaf:
+    mov rax, [r13 + 11]         ; Leer NODE_OFFSET_NEXT
+    test rax, rax
+    jz .finish_with_close       ; Si es 0, fin del Shard
+
+    lea r13, [r12 + rax]        ; R13 = Dirección de la nueva hoja
+    xor r8, r8                  ; Reiniciar índice
+    jmp .leaf_loop
 
 .finish_with_close:
     mov rdi, [rbp-8]
-    call close_socket           ; Final hygiene closure
+    call close_socket
     jmp .exit
 
 .err_bad_req:
     mov rdi, [rbp-8]
-    call handle_400             ; handle_400 already closes socket
+    call handle_400
     jmp .exit
 
 .err_not_found:
     mov rdi, [rbp-8]
-    call handle_404             ; handle_404 already closes socket
+    call handle_404
     jmp .exit
 
 .exit:
@@ -200,7 +225,7 @@ handle_scan:
 .clear_query_buffers:
     lea rdi, [q_prefix]
     xor rax, rax
-    mov rcx, 16                 ; 128 bytes
+    mov rcx, 16
     rep stosq
     mov dword [q_limit], 0
     ret
