@@ -1,0 +1,79 @@
+name: Security scans
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: SAST, dependency, secret and IaC scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trivy filesystem and IaC scan
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Gitleaks secret scan
+        id: gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: false
+
+      - name: Semgrep code scan
+        id: semgrep
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "${PWD}:/src" \
+            semgrep/semgrep:latest \
+            semgrep scan --config auto --error --sarif --output /src/semgrep-results.sarif /src
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            trivy-results.sarif
+            semgrep-results.sarif
+            gitleaks-report.sarif
+
+      - name: Enforce security gate
+        if: always()
+        shell: bash
+        run: |
+          failures=()
+          if [[ "${{ steps.trivy.outcome }}" != "success" ]]; then failures+=(trivy); fi
+          if [[ "${{ steps.gitleaks.outcome }}" != "success" ]]; then failures+=(gitleaks); fi
+          if [[ "${{ steps.semgrep.outcome }}" != "success" ]]; then failures+=(semgrep); fi
+
+          if (( ${#failures[@]} > 0 )); then
+            echo "Security checks failed: ${failures[*]}"
+            exit 1
+          fi
+
