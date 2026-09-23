@@ -1,6 +1,6 @@
 # ADR-0001: Modelo de concurrencia SWMR con consistencia por shard
 
-- **Estado:** Aceptado (en implementación)
+- **Estado:** Aceptado — Fase 1 (seqlock por shard) implementada y verificada
 - **Fecha:** 2026-01-24
 - **Decidido por:** bk (agente terminal), junto con la persona a cargo del repo
 - **Rama:** `feature/swmr-concurrency`

@@ -11,6 +11,8 @@
 extern handle_404, close_socket
 extern btree_find
 extern validated_key
+extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
+extern shard_seq_read       ; 🛡️ IMPORT: Seqlock reader snapshot
 
 ; --- Dynamic Configuration Dependencies ---
 extern rt_offset_len, rt_offset_val
@@ -37,19 +39,40 @@ handle_get:
     mov r12, rdi                ; r12 = Shard Base Pointer
     mov r13, rdx                ; r13 = Client Socket FD
 
-    ; 1. B-Tree Index Lookup
+    ; Resolve shard index for the seqlock (RBX persists across retries)
+    lea rsi, [validated_key]
+    call get_shard_index
+    mov rbx, rax                ; rbx = shard index
+
+    ; 1. Seqlock-guarded B-Tree Index Lookup (retry on concurrent write)
+.read_retry:
+    mov rdi, rbx
+    call shard_seq_read         ; RAX = seq1
+    test al, 1
+    jnz .read_retry             ; ODD: writer in progress, retry
+    push rax                    ; [rsp] = seq1
+
     mov rdi, r12
     lea rsi, [validated_key]
-    call btree_find
-    test rax, rax
-    jz .err_404
+    call btree_find             ; RAX = slot pointer (0 if miss)
+    mov r15, rax                ; r15 = slot pointer (preserve)
+
+    mov rdi, rbx
+    call shard_seq_read         ; RAX = seq2
+    pop rdx                     ; RDX = seq1
+    cmp rax, rdx
+    jne .read_retry             ; seq changed: torn read, retry
+
+    test r15, r15
+    jz .err_404                 ; consistent miss
 
     ; 2. Metadata Extraction (Dynamic Offsets)
-    ; RAX = Slot start, r14 = Payload length, r15 = Value Pointer
+    ; Slot content is immutable once linked, safe to read after seq verified.
+    ; r15 = Slot start, r14 = Payload length
     mov rdx, [rt_offset_len]
-    movzx r14, word [rax + rdx]
+    movzx r14, word [r15 + rdx]
     mov rdx, [rt_offset_val]
-    lea r15, [rax + rdx]
+    lea r15, [r15 + rdx]        ; r15 = Value Pointer
 
     ; 3. ITOS (Integer-to-ASCII) for Content-Length Header
     mov rax, r14

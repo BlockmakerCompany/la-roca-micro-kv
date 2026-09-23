@@ -71,6 +71,25 @@ Reader (btree_find / handle_scan):
 > El seqlock debe cubrir el insert **entero** (incluido el split), no solo el
 > slot, porque el árbol se muta en sitio.
 
+**Estado Fase 1: IMPLEMENTADA.** Cambios:
+
+- `src/core/storage.asm`: `seq_locks[27]`, `get_shard_index`, `shard_seq_inc`,
+  `shard_seq_read`.
+- `src/main.asm`: se eliminó el `seq_lock` global.
+- `src/handlers/set.asm` y `del.asm`: writer toma/suelta el lock del shard
+  correcto alrededor de la mutación.
+- `src/handlers/get.asm`: protocolo seqlock completo (paridad + reintento).
+- `src/handlers/scan.asm`: barrera seqlock antes de cada salto de hoja
+  (evita navegar el árbol durante un split/rebalance).
+
+> Nota de consistencia del scan: la barrera evita leer punteros a medio mutar,
+> pero un range-scan sobre datos mutando **no** es snapshot-consistente (un SET
+> entre dos hojas puede dar un rango ligeramente desalineado). Es un tradeoff
+> aceptado y documentado; el GET punto-a-punto sí es atómicamente consistente.
+
+Verificación Fase 1: `test_engine.sh`, `test_security.sh`, `test_concurrency.sh`
+y el nuevo `test_consistency.sh` pasan.
+
 ### Fase 2 — Backpressure con futex
 
 - `enqueue_job`: si `tail - head >= 16`, `sys_futex(FUTEX_WAIT)`.

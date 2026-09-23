@@ -63,10 +63,6 @@ section .bss
     ; 1. Stack for the writing thread (64KB)
     writer_stack resb 65536
 
-    ; 2. The Sequential Lock (0 = Free/Even, 1 = Writing/Odd)
-    global seq_lock
-    seq_lock     resq 1
-
 section .text
     global _start
 

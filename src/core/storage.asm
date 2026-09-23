@@ -27,18 +27,25 @@ section .data
 
 section .bss
     global db_ptrs
+    global seq_locks
     db_ptrs      resq 27
+    seq_locks    resq 27
     shard_name   resb 64
 
 section .text
     global init_storage
     global flush_shard
     global get_shard_ptr
+    global get_shard_index
+    global shard_seq_inc
+    global shard_seq_read
 
 ; -----------------------------------------------------------------------------
-; get_shard_ptr: Resolves the shard base address based on the key.
+; get_shard_index: Resolves the shard index (0-26) from the key's first char.
+; Input:  RSI = key pointer.
+; Output: RAX = index (0-26). Clobbers RAX only.
 ; -----------------------------------------------------------------------------
-get_shard_ptr:
+get_shard_index:
     movzx rax, byte [rsi]
     cmp al, 'A'
     jl .not_upper
@@ -50,13 +57,42 @@ get_shard_ptr:
     cmp al, 25
     jbe .valid_alpha
     mov rax, 26
-    jmp .load_ptr
+    ret
 .valid_alpha:
     movzx rax, al
-.load_ptr:
+    ret
+
+; -----------------------------------------------------------------------------
+; get_shard_ptr: Resolves the shard base address based on the key.
+; Input:  RSI = key pointer. Output: RDX = shard base pointer.
+; -----------------------------------------------------------------------------
+get_shard_ptr:
+    call get_shard_index
     shl rax, 3
     lea rcx, [db_ptrs]
     mov rdx, [rcx + rax]
+    ret
+
+; -----------------------------------------------------------------------------
+; shard_seq_inc: Increments the seqlock of a shard (writer begin/end barrier).
+; Input:  RDI = shard index (0-26). Clobbers RAX, RCX.
+; -----------------------------------------------------------------------------
+shard_seq_inc:
+    mov rax, rdi
+    shl rax, 3
+    lea rcx, [seq_locks]
+    lock inc qword [rcx + rax]
+    ret
+
+; -----------------------------------------------------------------------------
+; shard_seq_read: Reads the seqlock of a shard (reader snapshot).
+; Input:  RDI = shard index (0-26). Output: RAX = current sequence. Clobbers RCX.
+; -----------------------------------------------------------------------------
+shard_seq_read:
+    mov rax, rdi
+    shl rax, 3
+    lea rcx, [seq_locks]
+    mov rax, [rcx + rax]
     ret
 
 ; -----------------------------------------------------------------------------

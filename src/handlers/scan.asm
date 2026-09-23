@@ -11,6 +11,8 @@
 extern btree_search
 extern compare_keys
 extern get_shard_ptr
+extern get_shard_index      ; 🛡️ Shard index for per-shard seqlock
+extern shard_seq_read       ; 🛡️ Seqlock reader snapshot
 extern handle_400, handle_404, close_socket
 extern q_prefix, q_startkey, q_limit
 extern parse_query_params
@@ -59,11 +61,20 @@ handle_scan:
     jz .err_not_found
     mov r12, rdx                ; R12 = Shard Base Pointer
 
+    ; Resolve shard index for the per-shard seqlock
+    lea rsi, [q_prefix]
+    call get_shard_index
+    mov [rbp-16], rax           ; [rbp-16] = shard index
+
     lea rsi, [q_startkey]
     cmp byte [rsi], 0
     jne .do_jump
     lea rsi, [q_prefix]
 .do_jump:
+    ; Seqlock barrier: never traverse the tree while a split/rebalance is live.
+    mov rdi, [rbp-16]
+    call .seq_wait
+
     mov rdi, r12
     call btree_search           ; RAX = Offset of the Leaf Node
     test rax, rax
@@ -150,6 +161,10 @@ handle_scan:
     jmp .key_loop
 
 .next_leaf:
+    ; Seqlock barrier before following the NEXT pointer (avoids torn links).
+    mov rdi, [rbp-16]
+    call .seq_wait
+
     mov rax, [r13 + 11]         ; Read NODE_OFFSET_NEXT
     test rax, rax
     jz .finish_with_close       ; If 0, end of Shard reached
@@ -184,6 +199,20 @@ handle_scan:
     ret
 
 ; --- Helpers ---
+; .seq_wait: Spin until the shard seqlock is even (no writer in progress).
+; Input: RDI = shard index (0-26). Clobbers RAX.
+.seq_wait:
+    push rax
+.w_loop:
+    call shard_seq_read
+    test al, 1
+    jz .w_done
+    pause
+    jmp .w_loop
+.w_done:
+    pop rax
+    ret
+
 .send_trimmed_key:
     mov rsi, rbx
     xor rdx, rdx

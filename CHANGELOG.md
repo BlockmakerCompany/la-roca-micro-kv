@@ -5,6 +5,9 @@ El formato sigue Keep a Changelog y este proyecto usa versionado semántico.
 
 ## [Unreleased]
 
+### Added
+- per-shard seqlock with full reader-side protocol
+
 ### Changed
 - ignore db/ data directory and untrack shard files
 

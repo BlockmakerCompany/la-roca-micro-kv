@@ -33,8 +33,9 @@ extern handle_400, handle_507
 extern btree_insert, append_wal
 extern flush_shard
 extern rt_val_max_size
-extern seq_lock             ; 🛡️ IMPORT: The Sequential Lock
 extern get_shard_ptr        ; 🛡️ IMPORT: Shard resolution
+extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
+extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
 
 section .bss
     tmp_val    resb 8192
@@ -195,7 +196,14 @@ handle_set:
     ; 🛡️ OPTIMISTIC CONCURRENCY: SEQLOCK WRITER BOUNDARY
     ; =========================================================================
     DEBUG_LOG "Acquiring Seqlock & Inserting to B-Tree..."
-    lock inc qword [seq_lock]   ; +1 (Makes it ODD: Readers will spin-wait)
+
+    ; Resolve shard index for the per-shard seqlock (RBX survives btree_insert)
+    lea rsi, [writer_key]
+    call get_shard_index
+    mov rbx, rax
+
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE BEGIN: +1 (ODD -> readers spin/retry)
 
     mov rdi, r12
     lea rsi, [writer_key]
@@ -206,7 +214,8 @@ handle_set:
     pop r12
     push rax                    ; Save insertion result
 
-    lock inc qword [seq_lock]   ; +1 (Makes it EVEN: Readers can proceed)
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE END: +1 (EVEN -> readers can proceed)
     ; =========================================================================
 
     pop rax                     ; Restore insertion result

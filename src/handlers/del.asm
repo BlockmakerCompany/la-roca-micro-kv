@@ -13,6 +13,8 @@ extern handle_404, close_socket
 extern btree_delete, append_wal
 extern flush_shard
 extern validated_key        ; Cleaned 32-byte key buffer provided by Router
+extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
+extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
 
 section .text
     global handle_del
@@ -39,10 +41,22 @@ handle_del:
     xor rcx, rcx                ; Length 0
     call append_wal
 
-    ; 2. Update Index: B-Tree Deletion
+    ; 2. Update Index: B-Tree Deletion (under per-shard seqlock)
+    lea rsi, [validated_key]
+    call get_shard_index
+    mov rbx, rax
+
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE BEGIN: +1 (ODD -> readers spin/retry)
+
     mov rdi, r12
     lea rsi, [validated_key]
     call btree_delete           ; RAX=1 if found, 0 if miss
+
+    push rax                    ; 🛡️ Preserve result (shard_seq_inc clobbers RAX)
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE END: +1 (EVEN -> readers can proceed)
+    pop rax                     ; Restore btree_delete result
 
     ; Guard: If key miss, handle_404 will respond and CLOSE the socket
     test rax, rax
