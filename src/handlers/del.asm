@@ -11,7 +11,6 @@
 ; --- External Symbols ---
 extern handle_404, close_socket
 extern btree_delete, append_wal
-extern flush_shard
 extern validated_key        ; Cleaned 32-byte key buffer provided by Router
 extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
 extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
@@ -62,9 +61,8 @@ handle_del:
     test rax, rax
     jz .err_411_miss
 
-    ; 3. Hardware Commit
-    mov rdi, r12
-    call flush_shard
+    ; 🛡️ GROUP COMMIT: no per-request msync here. Durability via O_DSYNC WAL;
+    ; shard mmap is synced in batch by the writer thread (flush_all_shards).
 
     ; 4. Success Response (200 OK)
     mov rax, 1                  ; sys_write

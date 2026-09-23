@@ -32,6 +32,7 @@
 extern handle_set
 extern handle_del
 extern async_handoff        ; 🛡️ BANDERA GLOBAL PARA EL TRASPASO
+extern flush_all_shards     ; 🛡️ GROUP COMMIT: batch msync of all shards
 
 ; --- Futex / Queue constants ---
 %define SYS_FUTEX       202
@@ -39,6 +40,7 @@ extern async_handoff        ; 🛡️ BANDERA GLOBAL PARA EL TRASPASO
 %define FUTEX_WAKE      1
 %define QUEUE_CAPACITY  16
 %define JOB_SIZE        8208
+%define FLUSH_EVERY     32        ; group-commit: msync shards every N writes
 
 section .bss
     global queue_head
@@ -47,6 +49,7 @@ section .bss
 
     queue_head   resq 1
     queue_tail   resq 1
+    dirty_count  resq 1           ; writes since last group commit
 
     ; Array of 16 Jobs. Each job is 8208 bytes
     job_queue    resb 131328
@@ -103,6 +106,15 @@ writer_entry_point:
     mov rdx, 1
     xor r10, r10
     syscall
+
+    ; 🛡️ GROUP COMMIT: batch-flush the shard mmaps every FLUSH_EVERY writes.
+    inc qword [dirty_count]
+    cmp qword [dirty_count], FLUSH_EVERY
+    jb .skip_flush
+    call flush_all_shards
+    mov qword [dirty_count], 0
+.skip_flush:
+
     DEBUG_LOG "Job complete. Queue Head advanced."
     jmp .writer_poll
 

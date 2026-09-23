@@ -31,7 +31,6 @@
 
 extern handle_400, handle_507
 extern btree_insert, append_wal
-extern flush_shard
 extern rt_val_max_size
 extern get_shard_ptr        ; 🛡️ IMPORT: Shard resolution
 extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
@@ -222,8 +221,9 @@ handle_set:
     test rax, rax
     jz .err_full
 
-    mov rdi, r12                ; Restore Shard Pointer for sys_msync
-    call flush_shard
+    ; 🛡️ GROUP COMMIT: no per-request msync here. Durability is guaranteed by
+    ; the O_DSYNC WAL (append_wal above); the shard mmap is synced in batch by
+    ; the writer thread (see worker.asm / flush_all_shards).
     DEBUG_LOG "Transaction committed. Sending 200 OK..."
 
     mov rax, 1

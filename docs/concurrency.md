@@ -114,6 +114,24 @@ pasan.
 - Quitar `flush_shard` de SET/DELETE.
 - Durabilidad vía WAL (`O_DSYNC`); `msync` diferido a batch en el writer thread.
 
+**Estado Fase 3: IMPLEMENTADA.** Cambios:
+
+- `src/core/storage.asm`: nuevo `flush_all_shards` (recorre los 27 shards y hace
+  `msync` de cada uno). `flush_shard` sigue existiendo por compatibilidad.
+- `src/handlers/set.asm` y `del.asm`: se eliminó el `msync` de 64MB del camino
+  caliente. La durabilidad de cada write la garantiza el WAL abierto con
+  `O_DSYNC` (flag `0x1442` en `main.asm`).
+- `src/core/worker.asm`: el writer thread hace flush batch cada `FLUSH_EVERY`
+  (32) writes vía `flush_all_shards`.
+
+Resultado medido: **SET 155 → 822 req/s (~5.3x)**. El WAL `O_DSYNC` por write
+sigue siendo el próximo cuello de botella de escritura (candidato a group
+commit del fsync del WAL en una iteración futura).
+
+**Nota de durabilidad:** si el proceso muere entre dos flushes batch, las
+páginas sucias aún no sincronizadas a los shard files se reconstruyen desde el
+WAL en el arranque (`recover_from_wal`). No se pierde ningún write aceptado.
+
 ### Fase 4 — Concurrencia del servidor
 
 - 4a: acceptor + pool de N workers + `epoll`. GET en paralelo, SET por shard.

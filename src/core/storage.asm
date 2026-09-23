@@ -35,6 +35,7 @@ section .bss
 section .text
     global init_storage
     global flush_shard
+    global flush_all_shards
     global get_shard_ptr
     global get_shard_index
     global shard_seq_inc
@@ -96,13 +97,44 @@ shard_seq_read:
     ret
 
 ; -----------------------------------------------------------------------------
-; flush_shard: Synchronizes memory pages with the physical disk.
+; flush_shard: Synchronizes memory pages of ONE shard with the physical disk.
+; Input: RDI = shard base pointer. Clobbers RAX, RSI, RDX.
 ; -----------------------------------------------------------------------------
 flush_shard:
     mov rax, 26                 ; sys_msync
     mov rsi, db_size
     mov rdx, MS_SYNC
     syscall
+    ret
+
+; -----------------------------------------------------------------------------
+; flush_all_shards: Group-commit the mmap of all 27 shards to disk.
+; Called periodically by the writer thread (NOT per request). Durability of
+; individual writes is already guaranteed by the O_DSYNC WAL; this only keeps
+; the shard files eventually consistent so recovery can later skip stale WAL.
+; Clobbers RAX, RBX, R12, RSI, RDX, RDI.
+; -----------------------------------------------------------------------------
+flush_all_shards:
+    push rbx
+    push r12
+    xor r12, r12
+.fa_loop:
+    cmp r12, 27
+    je .fa_done
+    mov rbx, [db_ptrs + r12*8]
+    test rbx, rbx
+    jz .fa_next
+    mov rdi, rbx
+    mov rax, 26                 ; sys_msync
+    mov rsi, db_size
+    mov rdx, MS_SYNC
+    syscall
+.fa_next:
+    inc r12
+    jmp .fa_loop
+.fa_done:
+    pop r12
+    pop rbx
     ret
 
 ; -----------------------------------------------------------------------------
