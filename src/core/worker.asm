@@ -2,7 +2,9 @@
 ; Module: src/core/worker.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: The Writer Thread (Consumer) and Ring Buffer logic.
-;                 Manages async handoff with the Reader Thread.
+;                 Manages async handoff with the Reader Thread using a
+;                 futex-based producer/consumer pair (no busy-poll, no
+;                 silent overflow).
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
@@ -31,6 +33,13 @@ extern handle_set
 extern handle_del
 extern async_handoff        ; 🛡️ BANDERA GLOBAL PARA EL TRASPASO
 
+; --- Futex / Queue constants ---
+%define SYS_FUTEX       202
+%define FUTEX_WAIT      0
+%define FUTEX_WAKE      1
+%define QUEUE_CAPACITY  16
+%define JOB_SIZE        8208
+
 section .bss
     global queue_head
     global queue_tail
@@ -56,19 +65,19 @@ writer_entry_point:
     mov rax, [queue_head]
     mov rbx, [queue_tail]
     cmp rax, rbx
-    je .writer_sleep
+    je .writer_wait           ; Empty queue: sleep on queue_tail
 
     DEBUG_LOG "Job detected! Dequeuing..."
 
-    mov rcx, 16
+    mov rcx, QUEUE_CAPACITY
     xor rdx, rdx
-    div rcx
-    imul rdx, 8208
+    div rcx                   ; RAX = head/16, RDX = head % 16
+    imul rdx, JOB_SIZE
     lea r14, [job_queue + rdx]
 
-    mov rdx, [r14]              ; FD
-    mov r12, [r14 + 8]          ; Opcode
-    lea rsi, [r14 + 16]         ; Buffer
+    mov rdx, [r14]            ; FD
+    mov r12, [r14 + 8]        ; Opcode
+    lea rsi, [r14 + 16]       ; Buffer
 
     cmp r12, 1
     je .do_set
@@ -87,18 +96,26 @@ writer_entry_point:
 
 .job_done:
     lock inc qword [queue_head]
+    ; Wake any producer blocked on a full queue (waiting on queue_head).
+    mov rax, SYS_FUTEX
+    lea rdi, [queue_head]
+    mov rsi, FUTEX_WAKE
+    mov rdx, 1
+    xor r10, r10
+    syscall
     DEBUG_LOG "Job complete. Queue Head advanced."
     jmp .writer_poll
 
-.writer_sleep:
-    sub rsp, 16
-    mov qword [rsp], 0
-    mov qword [rsp+8], 1000000
-    mov rax, 35
-    mov rdi, rsp
-    xor rsi, rsi
+.writer_wait:
+    ; Sleep until a producer wakes us on queue_tail. RBX still holds the tail
+    ; value we observed; if a producer advances tail before we sleep, FUTEX_WAIT
+    ; returns EAGAIN immediately (no lost wakeup).
+    mov rax, SYS_FUTEX
+    lea rdi, [queue_tail]
+    mov rsi, FUTEX_WAIT
+    mov rdx, rbx              ; expected value = current tail
+    xor r10, r10
     syscall
-    add rsp, 16
     jmp .writer_poll
 
 ; =============================================================================
@@ -113,29 +130,44 @@ enqueue_job:
     push r13
     push r14
 
-    mov r12, rdi
-    mov r13, rsi
-    mov r14, rdx
+    mov r12, rdi              ; FD
+    mov r13, rsi              ; Opcode
+    mov r14, rdx              ; Buffer
 
+.enqueue_wait:
     mov rax, [queue_tail]
-    mov rcx, 16
+    mov rbx, [queue_head]
+    mov rcx, rax
+    sub rcx, rbx
+    cmp rcx, QUEUE_CAPACITY
+    jae .queue_full           ; No free slot: backpressure
+
+    ; Compute slot from tail
+    mov rcx, QUEUE_CAPACITY
     xor rdx, rdx
-    div rcx
-    imul rdx, 8208
+    div rcx                   ; RAX = tail/16, RDX = tail % 16
+    imul rdx, JOB_SIZE
     lea rbx, [job_queue + rdx]
 
-    mov [rbx], r12
-    mov [rbx + 8], r13
+    mov [rbx], r12            ; FD
+    mov [rbx + 8], r13        ; Opcode
 
     lea rdi, [rbx + 16]
     mov rsi, r14
-    mov rcx, 1024
+    mov rcx, 1024             ; 1024 qwords = 8192 bytes
     cld
     rep movsq
 
     lock inc qword [queue_tail]
 
-    ; 🛡️ LEVANTAMOS LA BANDERA PARA QUE MAIN.ASM ABANDONE EL SOCKET
+    ; Wake the writer (it may be sleeping on queue_tail).
+    mov rax, SYS_FUTEX
+    lea rdi, [queue_tail]
+    mov rsi, FUTEX_WAKE
+    mov rdx, 1
+    xor r10, r10
+    syscall
+
     mov byte [async_handoff], 1
 
     DEBUG_LOG "Reader Thread: Job successfully placed in Ring Buffer."
@@ -146,3 +178,15 @@ enqueue_job:
     pop rbx
     leave
     ret
+
+.queue_full:
+    ; Sleep until the writer advances queue_head (frees a slot). RBX holds the
+    ; head value we observed; a concurrent advance before we sleep makes
+    ; FUTEX_WAIT return EAGAIN immediately.
+    mov rax, SYS_FUTEX
+    lea rdi, [queue_head]
+    mov rsi, FUTEX_WAIT
+    mov rdx, rbx              ; expected value = current head
+    xor r10, r10
+    syscall
+    jmp .enqueue_wait

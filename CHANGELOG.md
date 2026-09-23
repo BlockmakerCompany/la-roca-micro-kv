@@ -7,6 +7,7 @@ El formato sigue Keep a Changelog y este proyecto usa versionado semántico.
 
 ### Added
 - per-shard seqlock with full reader-side protocol
+- futex-based ring buffer backpressure (no busy-poll, no overflow)
 
 ### Changed
 - ignore db/ data directory and untrack shard files

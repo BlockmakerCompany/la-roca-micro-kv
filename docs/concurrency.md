@@ -96,6 +96,19 @@ y el nuevo `test_consistency.sh` pasan.
 - writer: al avanzar `head`, `sys_futex(FUTEX_WAKE)`.
 - Se elimina el `nanosleep` busy-poll.
 
+**Estado Fase 2: IMPLEMENTADA.** `src/core/worker.asm` reescrito como par
+productor/consumidor sobre futex:
+
+- Consumidor (writer): si la cola está vacía, `FUTEX_WAIT` sobre `queue_tail`
+  con el valor de tail observado (sin lost-wakeup: EAGAIN si avanzó antes de
+  dormir).
+- Productor (`enqueue_job`): si la cola está llena, `FUTEX_WAIT` sobre
+  `queue_head`; al enqueuar hace `FUTEX_WAKE` sobre `queue_tail`.
+- Consumidor hace `FUTEX_WAKE` sobre `queue_head` al liberar un slot.
+
+Verificación: `test_engine.sh`, `test_consistency.sh`, `test_concurrency.sh`
+pasan.
+
 ### Fase 3 — Group commit
 
 - Quitar `flush_shard` de SET/DELETE.
