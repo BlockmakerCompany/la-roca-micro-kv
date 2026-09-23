@@ -22,6 +22,7 @@ OBJS = $(BUILD_DIR)/main.o \
        $(BUILD_DIR)/env_parser.o \
        $(BUILD_DIR)/http_parser.o \
        $(BUILD_DIR)/storage.o \
+       $(BUILD_DIR)/worker.o \
        $(BUILD_DIR)/router.o \
        $(BUILD_DIR)/router_system.o \
        $(BUILD_DIR)/router_keys.o \
@@ -66,6 +67,8 @@ $(BUILD_DIR)/env_parser.o: $(SRC_DIR)/core/env_parser.asm
 $(BUILD_DIR)/http_parser.o: $(SRC_DIR)/core/http_parser.asm
 	$(ASM) $(ASM_FLAGS) $< -o $@
 $(BUILD_DIR)/storage.o: $(SRC_DIR)/core/storage.asm
+	$(ASM) $(ASM_FLAGS) $< -o $@
+$(BUILD_DIR)/worker.o: $(SRC_DIR)/core/worker.asm
 	$(ASM) $(ASM_FLAGS) $< -o $@
 
 # 3. Router Tier (New Specialized Directory)

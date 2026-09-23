@@ -1,8 +1,8 @@
 ; -----------------------------------------------------------------------------
 ; Module: src/routers/router_keys_set.asm
 ; Project: La Roca Micro-KV
-; Responsibility: Route POST requests for individual keys.
-;                 Implements concurrency control via Spinlocks.
+; Responsibility: Route POST requests.
+;                 Delegates processing to the Writer Thread via Ring Buffer.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
@@ -30,10 +30,7 @@
 %endmacro
 
 ; --- External Primitives ---
-extern get_shard_ptr
-extern handle_set, handle_400, handle_404
-extern validated_key
-extern acquire_lock, release_lock   ; From utils.asm
+extern enqueue_job
 
 section .text
     global route_keys_set
@@ -45,6 +42,8 @@ section .text
 ;   RSI = Request Buffer
 ; -----------------------------------------------------------------------------
 route_keys_set:
+    push rbp
+    mov rbp, rsp
     push rbx
     push r12
     push r13
@@ -52,82 +51,20 @@ route_keys_set:
     mov r12, rdi                ; r12 = Socket FD
     mov r13, rsi                ; r13 = Buffer
 
-    TRACE "Sub-router SET (POST) activated"
+    TRACE "Sub-router SET (POST) activated. Enqueuing job..."
 
-    ; 1. Calculate URI start
-    ; For POST, the offset is usually "POST " (5 bytes)
-    lea rsi, [r13 + 5]
+    ; 1. Push to the Message Queue (Ring Buffer)
+    mov rdi, r12                ; Arg 1: FD
+    mov rsi, 1                  ; Arg 2: Opcode (1 = SET)
+    mov rdx, r13                ; Arg 3: Raw Request Buffer
+    call enqueue_job
 
-    ; 2. Skip "/keys/" (6 bytes)
-    add rsi, 6
-
-    ; 3. Clear validated_key buffer
-    lea rdi, [validated_key]
-    xor rax, rax
-    mov rcx, 32                 ; 256 bytes total
-    rep stosq
-
-    ; 4. Key Extraction
-    lea rdi, [validated_key]
-    xor rcx, rcx
-.ext_loop:
-    lodsb
-    cmp al, ' '                 ; End of URI
-    je .ext_done
-    test al, al
-    jz .ext_done
-
-    inc rcx
-    cmp rcx, 31                 ; Hard limit
-    ja .err_400
-
-    stosb
-    jmp .ext_loop
-
-.ext_done:
-    test rcx, rcx
-    jz .err_404
-
-    ; 5. Shard Resolution
-    TRACE "Key extracted. Resolving shard..."
-    lea rsi, [validated_key]
-    call get_shard_ptr
-
-    ; Preparation for handler
-    mov rdi, rdx                ; RDI = Shard pointer
-    mov rsi, r13                ; RSI = Original Buffer
-    mov rdx, r12                ; RDX = Socket FD
-
-    ; 6. 🔒 CONCURRENCY CONTROL: ACQUIRE LOCK
-    ; We lock the entire engine before the SET handler starts writing
-    ; to the WAL and the B-Tree to prevent race conditions.
-    TRACE "Acquiring global shard lock..."
-    call acquire_lock
-
-    ; 7. Execute SET handler
-    TRACE "Dispatching to handle_set"
-    call handle_set
-
-    ; 8. 🔓 RELEASE LOCK
-    TRACE "Releasing global shard lock"
-    call release_lock
-
-    mov rax, 1                  ; Handled
-    jmp .exit
-
-.err_400:
-    mov rdi, r12
-    call handle_400
-    mov rax, 1
-    jmp .exit
-
-.err_404:
-    mov rdi, r12
-    call handle_404
+    ; 2. Signal the routing chain that this route matched.
+    ; (main.asm will see async_handoff == 1 and abandon the socket).
     mov rax, 1
 
-.exit:
     pop r13
     pop r12
     pop rbx
+    leave
     ret
