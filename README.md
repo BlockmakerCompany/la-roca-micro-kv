@@ -861,7 +861,23 @@ Ensures that runtime geometry (Key/Value sizes) and environment variables are co
 ---
 
 ### ⚡ Stress Testing & Benchmarking
-To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls. With Keep-Alive enabled, the engine consistently achieves **p(95) latencies under 1 millisecond**.
+To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls. With Keep-Alive enabled, **reads** consistently achieve **p(95) latencies under 1 millisecond**. **Writes** are bound by the durability guarantee (WAL `O_DSYNC` + `sys_fdatasync`), so their latency reflects the physical commit to disk.
+
+#### 📈 Measured Results (branch `feature/swmr-concurrency`)
+
+Local, on a development machine (no cgroups, no NVMe), against a freshly
+compiled binary:
+
+| Test | Metric | Result | Notes |
+| :--- | :--- | :--- | :--- |
+| GET (curl, 20 concurrent) | throughput | **~1224 req/s** | read path unchanged (no regression). |
+| SET (curl, 20 concurrent) | throughput | **~885 req/s** | ~5.7x over the 155 req/s baseline. |
+| K6 stress (50 VUs, 4196 POSTs) | throughput | **~1437 req/s** | `p(95)=39.45ms`, threshold `<75ms` ✅, 0 failed requests. |
+
+The write-path jump comes from removing the per-request 64MB `msync`
+(`flush_shard`) and relying on WAL `O_DSYNC` durability + a batched shard flush
+(see `docs/concurrency.md`, Fase 3). Full local numbers and methodology:
+`docs/benchmarks-local.md`.
 
 #### Modern Observability (K6)
 ```bash

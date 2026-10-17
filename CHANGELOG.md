@@ -15,16 +15,20 @@ El formato sigue Keep a Changelog y este proyecto usa versionado semántico.
 
 ### Fixed
 - dynamic key geometry for SWMR (rt_key_size)
-
 - B-tree entries now use rt_key_size instead of hardcoded 32-byte keys
-  (btree.asm, search_engine.asm): entry width and node capacity are
-  recomputed in config_runtime.asm (rt_entry_size, rt_node_max_keys).
 - Handlers/routers (set, del, scan, router_keys, router_keys_get) enforce
-  the key length limit from rt_key_size instead of a fixed 31.
 - Fixes test_config_persistence.sh: with ROCK_KEY_SIZE=64, POST wrote the
-  slot but GET returned Not Found because the index was still 32-wide.
-
-Verificado: ./tests/run_all_tests.sh -> 6/6 suites en verde.
 
 ### Docs
 - add concurrency ADR, model, and local benchmark baseline
+- document measured SWMR performance
+
+- README: add measured results (GET ~1224 req/s, SET ~885 req/s, k6
+  50 VUs ~1437 req/s / p95 39.45ms) and clarify read vs write latency.
+- ARCHITECTURE: add §3.4 SWMR concurrency model (per-shard seqlock,
+  futex backpressure, group commit); note dynamic B+Tree key geometry.
+- docs/benchmarks-local.md: record final phase (GET 1224, SET 885) and
+  the k6 stress test run.
+
+Verified this session: make clean && make, local curl benchmark, and
+k6 run tests/stress_test.js (threshold p(95)<75ms passed).
