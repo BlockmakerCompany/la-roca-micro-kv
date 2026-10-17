@@ -141,23 +141,6 @@ graph TD
     style Loop fill:#cff4fc,stroke:#055160
 ```
 
-### 3.3 The Assembly HTTP Parser: Attack Surface Reduction
-General-purpose HTTP parsers are often multi-megabyte liabilities prone to complex exploits. La Roca uses a **Minimalist State Machine** written in pure Assembly.
-
-* **Byte-by-Byte Scanning:** Instead of using expensive string functions, the engine scans the input buffer in a single pass using the `lodsb` instruction.
-* **Security by Omission:** By not implementing 99% of unnecessary HTTP specifications, we eliminate entire classes of vulnerabilities (e.g., Request Smuggling).
-* **The "Drop-on-Error" Policy:** If the incoming bytes do not strictly match our expected REST verbs, the engine triggers an immediate `sys_close`. This makes the engine an extremely small and "hard" target.
-
-```mermaid
-graph TD
-    Socket[TCP Socket] -->|Raw Bytes| Parser{Assembly State Machine}
-    Parser -->|Invalid/Bloat| Drop[sys_close / Instant Reject]
-    Parser -->|Valid GET/POST| Action[Process Route]
-    
-    style Drop fill:#f8d7da,stroke:#842029
-    style Action fill:#d1e7dd,stroke:#0f5132
-```
-
 ---
 
 ## 3.4 Concurrency Model: Single-Writer, Multi-Reader (SWMR)
@@ -226,7 +209,7 @@ La Roca is designed to be the bedrock of a new generation of hyper-efficient inf
 
 * **Design & Architecture:** Fernando E. Mancuso & BlockMaker Engineering
 * **Organization:** [BlockmakerCompany](https://github.com/BlockmakerCompany)
-* **Release:** April 2026 | Stable Build 1.1.0
+* **Release:** April 2026 | Stable Build 1.2.0
 * **Inquiries:** For industrial integration or low-level consulting, reach out via [GitHub Issues](https://github.com/BlockmakerCompany/la-roca-micro-kv/issues).
 
 > *"If it requires a library, it doesn't belong in the core."* > — **The BlockMaker Manifesto**

@@ -5,6 +5,8 @@ El formato sigue Keep a Changelog y este proyecto usa versionado semántico.
 
 ## [Unreleased]
 
+## [v1.2.0] - 2026-10-17
+
 ### Added
 - per-shard seqlock with full reader-side protocol
 - futex-based ring buffer backpressure (no busy-poll, no overflow)
@@ -22,13 +24,6 @@ El formato sigue Keep a Changelog y este proyecto usa versionado semántico.
 ### Docs
 - add concurrency ADR, model, and local benchmark baseline
 - document measured SWMR performance
-
 - README: add measured results (GET ~1224 req/s, SET ~885 req/s, k6
-  50 VUs ~1437 req/s / p95 39.45ms) and clarify read vs write latency.
 - ARCHITECTURE: add §3.4 SWMR concurrency model (per-shard seqlock,
-  futex backpressure, group commit); note dynamic B+Tree key geometry.
 - docs/benchmarks-local.md: record final phase (GET 1224, SET 885) and
-  the k6 stress test run.
-
-Verified this session: make clean && make, local curl benchmark, and
-k6 run tests/stress_test.js (threshold p(95)<75ms passed).
