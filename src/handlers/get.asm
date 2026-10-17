@@ -10,15 +10,11 @@
 ; --- External Symbols ---
 extern handle_404, close_socket
 extern btree_find
-extern validated_key
 extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
 extern shard_seq_read       ; 🛡️ IMPORT: Seqlock reader snapshot
 
 ; --- Dynamic Configuration Dependencies ---
 extern rt_offset_len, rt_offset_val
-
-section .bss
-    ascii_len  resb 16
 
 section .text
     global handle_get
@@ -40,7 +36,8 @@ handle_get:
     mov r13, rdx                ; r13 = Client Socket FD
 
     ; Resolve shard index for the seqlock (RBX persists across retries)
-    lea rsi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_VALIDATED_KEY]
     call get_shard_index
     mov rbx, rax                ; rbx = shard index
 
@@ -53,7 +50,8 @@ handle_get:
     push rax                    ; [rsp] = seq1
 
     mov rdi, r12
-    lea rsi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_VALIDATED_KEY]
     call btree_find             ; RAX = slot pointer (0 if miss)
     mov r15, rax                ; r15 = slot pointer (preserve)
 
@@ -76,7 +74,8 @@ handle_get:
 
     ; 3. ITOS (Integer-to-ASCII) for Content-Length Header
     mov rax, r14
-    lea rdi, [ascii_len + 15]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_ASCII_LEN + 15]
     mov byte [rdi], 0
     mov rbx, 10
 .itoa:
@@ -90,7 +89,8 @@ handle_get:
 
     ; Prepare dynamic length write parameters
     mov rbx, rdi                ; rbx = ASCII start pointer
-    lea rdx, [ascii_len + 15]
+    mov r11, [fs:TLS_SELF]
+    lea rdx, [r11 + TLS_ASCII_LEN + 15]
     sub rdx, rbx                ; rdx = ASCII length
     push rdx
 

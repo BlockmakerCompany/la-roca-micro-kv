@@ -30,7 +30,6 @@
 %endmacro
 
 extern handle_scan, handle_400
-extern q_prefix, q_startkey, q_limit
 
 section .text
     global route_keys_search
@@ -99,20 +98,22 @@ route_keys_search:
 
 .extract_prefix:
     add rsi, 7                  ; Skip "prefix="
-    lea rdi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_PREFIX]
     call .extract_value
     jmp .next_param
 
 .extract_start:
     add rsi, 9                  ; Skip "startkey=" (o ajusta según tu protocolo)
-    lea rdi, [q_startkey]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_STARTKEY]
     call .extract_value
     jmp .next_param
 
 .extract_limit:
     add rsi, 6                  ; Skip "limit="
     call .extract_int
-    mov [q_limit], eax
+    mov [fs:TLS_Q_LIMIT], eax
     ; .extract_int already advanced RSI to delimiter
     jmp .next_param
 
@@ -133,14 +134,16 @@ route_keys_search:
 ; --- Internal Helpers ---
 
 .reset_query_buffers:
-    lea rdi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_PREFIX]
     xor rax, rax
     mov rcx, 64                 ; 256 bytes / 4
     rep stosd
-    lea rdi, [q_startkey]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_STARTKEY]
     mov rcx, 64
     rep stosd
-    mov dword [q_limit], 100    ; Default limit
+    mov dword [fs:TLS_Q_LIMIT], 100    ; Default limit
     ret
 
 .extract_value:

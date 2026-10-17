@@ -13,8 +13,9 @@ extern compare_keys
 extern get_shard_ptr
 extern get_shard_index      ; 🛡️ Shard index for per-shard seqlock
 extern shard_seq_read       ; 🛡️ Seqlock reader snapshot
+extern rt_key_size
+extern rt_entry_size
 extern handle_400, handle_404, close_socket
-extern q_prefix, q_startkey, q_limit
 extern parse_query_params
 
 section .data
@@ -52,7 +53,8 @@ handle_scan:
     call parse_query_params
 
     ; --- 2. B+ TREE LEAF JUMP ---
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     cmp byte [rsi], 0
     je .err_bad_req
 
@@ -62,14 +64,17 @@ handle_scan:
     mov r12, rdx                ; R12 = Shard Base Pointer
 
     ; Resolve shard index for the per-shard seqlock
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     call get_shard_index
     mov [rbp-16], rax           ; [rbp-16] = shard index
 
-    lea rsi, [q_startkey]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_STARTKEY]
     cmp byte [rsi], 0
     jne .do_jump
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
 .do_jump:
     ; Seqlock barrier: never traverse the tree while a split/rebalance is live.
     mov rdi, [rbp-16]
@@ -89,8 +94,8 @@ handle_scan:
     je .start_harvest           ; If not found, start harvesting in the next leaf
 
     mov rax, r8
-    imul rax, 40                ; ENTRY_SIZE
-    lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey
+    imul rax, [rt_entry_size]
+    lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey (19 = HEADER_SIZE)
 
     ; RSI already contains the preserved Search Key
     call compare_keys
@@ -111,7 +116,7 @@ handle_scan:
 
     ; --- 5. HARVEST LOOP (B+ Tree Linked List) ---
     xor r14, r14                ; R14 = Results counter
-    mov r15d, [q_limit]
+    mov r15d, [fs:TLS_Q_LIMIT]
     test r15d, r15d
     jnz .leaf_loop
     mov r15d, 50                ; Default limit
@@ -124,7 +129,7 @@ handle_scan:
     jae .next_leaf              ; If keys are exhausted, jump to the next leaf
 
     mov rax, r8
-    imul rax, 40
+    imul rax, [rt_entry_size]
     lea rbx, [r13 + 19 + rax]   ; RBX = Pointer to the current key
 
     ; --- TELEMETRY (STDOUT) ---
@@ -135,7 +140,7 @@ handle_scan:
     syscall
     mov rax, 1
     mov rsi, rbx
-    mov rdx, 32
+    mov rdx, [rt_key_size]
     syscall
     mov rax, 1
     lea rsi, [newline]
@@ -143,7 +148,8 @@ handle_scan:
     syscall
 
     ; --- PREFIX VALIDATION ---
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     mov rdi, rbx
     call .check_prefix
     test rax, rax
@@ -220,7 +226,7 @@ handle_scan:
     cmp byte [rsi + rdx], 0
     je .tw
     inc rdx
-    cmp rdx, 32
+    cmp rdx, [rt_key_size]
     je .tw
     jmp .tl
 .tw:
@@ -252,9 +258,10 @@ handle_scan:
     ret
 
 .clear_query_buffers:
-    lea rdi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_PREFIX]
     xor rax, rax
     mov rcx, 16
     rep stosq
-    mov dword [q_limit], 0
+    mov dword [fs:TLS_Q_LIMIT], 0
     ret

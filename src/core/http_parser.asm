@@ -6,8 +6,7 @@
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
-; --- Global Query Buffers (Defined in router.asm) ---
-extern q_prefix, q_startkey, q_limit
+; --- Query buffers live in the thread's TLS block (fs:[TLS_Q_*]) ---
 
 section .data
     p_prefix    db "prefix=", 0
@@ -45,7 +44,8 @@ parse_query_params:
     test rax, rax
     jz .is_lim
     add rdi, 7                  ; Skip "prefix="
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     call .copy_val
     jmp .next_param
 
@@ -70,7 +70,8 @@ parse_query_params:
     test rax, rax
     jz .next_param
     add rdi, 9                  ; Skip "startkey="
-    lea rsi, [q_startkey]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_STARTKEY]
     call .copy_val
 
 .next_param:
@@ -160,5 +161,5 @@ parse_query_params:
     jbe .at_save
     mov rax, 500
 .at_save:
-    mov [q_limit], eax
+    mov [fs:TLS_Q_LIMIT], eax
     ret

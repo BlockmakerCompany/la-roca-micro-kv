@@ -8,30 +8,14 @@
 %include "config.inc"
 %include "responses.inc"
 
-; --- Telemetry Macro ---
+; --- Telemetry Macro (no-op) ---
 %macro DEBUG_LOG 1
-    section .data
-        %%msg db "[DEBUG:SET] ", %1, 0x0A
-        %%len equ $ - %%msg
-    section .text
-        push rax
-        push rdi
-        push rsi
-        push rdx
-        mov rax, 1
-        mov rdi, 1
-        lea rsi, [%%msg]
-        mov rdx, %%len
-        syscall
-        pop rdx
-        pop rsi
-        pop rdi
-        pop rax
 %endmacro
 
 extern handle_400, handle_507
 extern btree_insert, append_wal
 extern rt_val_max_size
+extern rt_key_size
 extern get_shard_ptr        ; 🛡️ IMPORT: Shard resolution
 extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
 extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
@@ -82,8 +66,8 @@ handle_set:
     test al, al
     jz .ext_done
     inc rcx
-    cmp rcx, 31                 ; Hard limit
-    ja .err_400
+    cmp rcx, [rt_key_size]      ; Hard limit (dynamic geometry)
+    jae .err_400
     stosb
     jmp .ext_loop
 

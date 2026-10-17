@@ -9,15 +9,14 @@
 ; --- External dynamic configuration ---
 extern rt_slot_size
 extern rt_key_size
+extern rt_entry_size
 
 ; --- External B+ Tree functions (from btree.asm) ---
 extern btree_search
 
-; --- Constants for B+ Tree Leaf Navigation ---
+; --- Constants for B+ Tree Leaf Navigation (entry width is dynamic) ---
 %define NODE_OFFSET_KEYS     1
 %define HEADER_SIZE          19
-%define MAX_KEY_SIZE         32
-%define ENTRY_SIZE           40
 
 section .text
     global btree_find
@@ -50,7 +49,7 @@ btree_find:
 
     ; Calculate pointer to current key in the leaf
     mov rax, r9
-    imul rax, ENTRY_SIZE
+    imul rax, [rt_entry_size]
     lea rdi, [rbx + HEADER_SIZE + rax]
 
     ; Compare Keys (compare_keys safely preserves RDI/RSI)
@@ -61,8 +60,9 @@ btree_find:
     jmp .find_key
 
 .found_it:
-    ; Extract the 8-byte pointer attached to the key
-    mov rax, [rdi + MAX_KEY_SIZE]
+    ; Extract the 8-byte pointer attached to the key (right after the key bytes)
+    mov rdx, [rt_key_size]
+    mov rax, [rdi + rdx]
     add rax, r12            ; Add Shard Base (Final physical memory address)
     jmp .exit_get
 

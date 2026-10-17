@@ -2,43 +2,25 @@
 ; Module: src/core/worker.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: The Writer Thread (Consumer) and Ring Buffer logic.
-;                 Manages async handoff with the Reader Thread using a
-;                 futex-based producer/consumer pair (no busy-poll, no
-;                 silent overflow).
+;                 Manages async handoff with Reader Threads using a
+;                 futex-based multi-producer / single-consumer pair.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
-; --- Telemetry Macro ---
+; --- Telemetry Macro (no-op) ---
 %macro DEBUG_LOG 1
-    section .data
-        %%msg db "[DEBUG:WORKER] ", %1, 0x0A
-        %%len equ $ - %%msg
-    section .text
-        push rax
-        push rdi
-        push rsi
-        push rdx
-        mov rax, 1
-        mov rdi, 1
-        lea rsi, [%%msg]
-        mov rdx, %%len
-        syscall
-        pop rdx
-        pop rsi
-        pop rdi
-        pop rax
 %endmacro
 
 extern handle_set
 extern handle_del
-extern async_handoff        ; 🛡️ BANDERA GLOBAL PARA EL TRASPASO
 extern flush_all_shards     ; 🛡️ GROUP COMMIT: batch msync of all shards
 
 ; --- Futex / Queue constants ---
 %define SYS_FUTEX       202
 %define FUTEX_WAIT      0
 %define FUTEX_WAKE      1
-%define QUEUE_CAPACITY  16
+%define QUEUE_CAPACITY  64
+%define QUEUE_MASK      63
 %define JOB_SIZE        8208
 %define FLUSH_EVERY     32        ; group-commit: msync shards every N writes
 
@@ -47,34 +29,51 @@ section .bss
     global queue_tail
     global job_queue
 
-    queue_head   resq 1
-    queue_tail   resq 1
-    dirty_count  resq 1           ; writes since last group commit
+    queue_head    resq 1
+    queue_tail    resq 1
+    producer_lock resd 1
+    dirty_count   resq 1          ; writes since last group commit
 
-    ; Array of 16 Jobs. Each job is 8208 bytes
-    job_queue    resb 131328
+    ; Array of 64 Jobs. Each job is 8208 bytes (64 * 8208 = 525312 bytes)
+    job_queue     resb 525312
 
 section .text
     global writer_entry_point
     global enqueue_job
 
 ; =============================================================================
+; PRODUCER SPINLOCK HELPERS
+; =============================================================================
+acquire_producer_lock:
+.try_acquire:
+    mov eax, 1
+    xchg eax, [producer_lock]
+    test eax, eax
+    jz .acquired
+.spin:
+    pause
+    cmp dword [producer_lock], 0
+    jne .spin
+    jmp .try_acquire
+.acquired:
+    ret
+
+release_producer_lock:
+    mov dword [producer_lock], 0
+    ret
+
+; =============================================================================
 ; THE CONSUMER: WRITER THREAD MAIN LOOP
 ; =============================================================================
 writer_entry_point:
-    DEBUG_LOG "Writer Thread Online. Awaiting jobs."
-
 .writer_poll:
     mov rax, [queue_head]
     mov rbx, [queue_tail]
     cmp rax, rbx
     je .writer_wait           ; Empty queue: sleep on queue_tail
 
-    DEBUG_LOG "Job detected! Dequeuing..."
-
-    mov rcx, QUEUE_CAPACITY
-    xor rdx, rdx
-    div rcx                   ; RAX = head/16, RDX = head % 16
+    mov rdx, rax
+    and rdx, QUEUE_MASK
     imul rdx, JOB_SIZE
     lea r14, [job_queue + rdx]
 
@@ -89,12 +88,10 @@ writer_entry_point:
     jmp .job_done
 
 .do_set:
-    DEBUG_LOG "Dispatching to handle_set..."
     call handle_set
     jmp .job_done
 
 .do_del:
-    DEBUG_LOG "Dispatching to handle_del..."
     call handle_del
 
 .job_done:
@@ -115,7 +112,6 @@ writer_entry_point:
     mov qword [dirty_count], 0
 .skip_flush:
 
-    DEBUG_LOG "Job complete. Queue Head advanced."
     jmp .writer_poll
 
 .writer_wait:
@@ -131,10 +127,9 @@ writer_entry_point:
     jmp .writer_poll
 
 ; =============================================================================
-; THE PRODUCER: ENQUEUE FUNCTION (Called by Reader Thread)
+; THE PRODUCER: ENQUEUE FUNCTION (Called concurrently by Reader Threads)
 ; =============================================================================
 enqueue_job:
-    DEBUG_LOG "Reader Thread: Enqueuing new job..."
     push rbp
     mov rbp, rsp
     push rbx
@@ -146,18 +141,33 @@ enqueue_job:
     mov r13, rsi              ; Opcode
     mov r14, rdx              ; Buffer
 
-.enqueue_wait:
+.enqueue_retry:
+    call acquire_producer_lock
+
     mov rax, [queue_tail]
     mov rbx, [queue_head]
     mov rcx, rax
     sub rcx, rbx
     cmp rcx, QUEUE_CAPACITY
-    jae .queue_full           ; No free slot: backpressure
+    jb .slot_ready
 
-    ; Compute slot from tail
-    mov rcx, QUEUE_CAPACITY
-    xor rdx, rdx
-    div rcx                   ; RAX = tail/16, RDX = tail % 16
+    ; Queue is full: release lock before sleeping to avoid blocking other producers
+    call release_producer_lock
+
+    ; Sleep until the writer advances queue_head (frees a slot).
+    ; RBX holds observed queue_head; if writer advanced it, FUTEX_WAIT returns -EAGAIN.
+    mov rax, SYS_FUTEX
+    lea rdi, [queue_head]
+    mov rsi, FUTEX_WAIT
+    mov rdx, rbx              ; expected value = current head
+    xor r10, r10
+    syscall
+    jmp .enqueue_retry
+
+.slot_ready:
+    ; RAX = current queue_tail
+    mov rdx, rax
+    and rdx, QUEUE_MASK
     imul rdx, JOB_SIZE
     lea rbx, [job_queue + rdx]
 
@@ -172,6 +182,9 @@ enqueue_job:
 
     lock inc qword [queue_tail]
 
+    ; Release producer lock now that slot is populated and tail is updated
+    call release_producer_lock
+
     ; Wake the writer (it may be sleeping on queue_tail).
     mov rax, SYS_FUTEX
     lea rdi, [queue_tail]
@@ -180,9 +193,7 @@ enqueue_job:
     xor r10, r10
     syscall
 
-    mov byte [async_handoff], 1
-
-    DEBUG_LOG "Reader Thread: Job successfully placed in Ring Buffer."
+    mov byte [fs:TLS_ASYNC_HANDOFF], 1
 
     pop r14
     pop r13
@@ -190,15 +201,3 @@ enqueue_job:
     pop rbx
     leave
     ret
-
-.queue_full:
-    ; Sleep until the writer advances queue_head (frees a slot). RBX holds the
-    ; head value we observed; a concurrent advance before we sleep makes
-    ; FUTEX_WAIT return EAGAIN immediately.
-    mov rax, SYS_FUTEX
-    lea rdi, [queue_head]
-    mov rsi, FUTEX_WAIT
-    mov rdx, rbx              ; expected value = current head
-    xor r10, r10
-    syscall
-    jmp .enqueue_wait

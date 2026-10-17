@@ -31,7 +31,7 @@
 
 extern get_shard_ptr
 extern handle_get, handle_del, handle_400, handle_404
-extern validated_key
+extern rt_key_size
 
 section .text
     global route_keys_get
@@ -67,13 +67,15 @@ route_keys_get:
     add rsi, 6
 
     ; 2. Clear validated_key buffer
-    lea rdi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_VALIDATED_KEY]
     xor rax, rax
     mov rcx, 32                 ; Clear 256 bytes (32 * 8)
     rep stosq
 
     ; 3. Extract Key from URI
-    lea rdi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_VALIDATED_KEY]
     xor rcx, rcx
 .ext_loop:
     lodsb
@@ -83,8 +85,8 @@ route_keys_get:
     jz .ext_done
 
     inc rcx
-    cmp rcx, 31                 ; Max key length safety
-    ja .err_400
+    cmp rcx, [rt_key_size]      ; Max key length safety (dynamic geometry)
+    jae .err_400
 
     stosb
     jmp .ext_loop
@@ -96,7 +98,8 @@ route_keys_get:
     TRACE "Key extracted successfully, resolving shard..."
 
     ; 4. Shard Resolution and Dispatch
-    lea rsi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_VALIDATED_KEY]
     call get_shard_ptr
 
     mov rdi, rdx                ; RDI = Shard pointer

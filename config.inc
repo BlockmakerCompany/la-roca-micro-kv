@@ -37,6 +37,28 @@
 %define OFFSET_TYPE     34              ; Offset within slot for Record Status
 %define OFFSET_VAL      35              ; Offset within slot for Binary Payload
 
+; --- B+ Tree Geometry (Shared with config_runtime) ---
+; A tree entry is [KEY(rt_key_size)] [CHILD/POINTER(8)]; node layout is fixed.
+%define BTREE_PAGE_SIZE    262144       ; 256KB Mega-Page per node
+%define BTREE_HEADER_SIZE  19           ; Node header: type(1) keys(2) parent(8) next(8)
+
+; -----------------------------------------------------------------------------
+; Per-Thread Context (TLS) — accessed via FS segment base.
+; Each reader thread sets FS to its own block (clone CLONE_SETTLS / arch_prctl).
+; Writer thread does NOT use TLS (handlers are self-contained with own buffers).
+; -----------------------------------------------------------------------------
+%define TLS_SELF            0          ; qword: pointer to this thread's TLS block itself
+%define TLS_CLIENT_FD       8          ; qword: accepted socket fd
+%define TLS_KA_FLAG         16         ; byte:  keep-alive detection result
+%define TLS_ASYNC_HANDOFF   17         ; byte:  router handed socket to writer
+%define TLS_REQUEST_BUF     32         ; 8192 bytes: raw HTTP request
+%define TLS_VALIDATED_KEY   8224       ; 256 bytes: extracted key
+%define TLS_ASCII_LEN       8480       ; 16 bytes: Content-Length itoa buffer
+%define TLS_Q_PREFIX        8496       ; 256 bytes: scan 'prefix' param
+%define TLS_Q_STARTKEY      8752       ; 256 bytes: scan 'startkey' param
+%define TLS_Q_LIMIT         9008       ; dword: scan 'limit' param
+%define TLS_SIZE            9024       ; total per-thread context (16-byte aligned)
+
 ; -----------------------------------------------------------------------------
 ; Global Macros (Overloaded)
 ; -----------------------------------------------------------------------------

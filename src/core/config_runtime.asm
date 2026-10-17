@@ -20,6 +20,7 @@ section .bss
     global rt_port, rt_key_size, rt_val_max_size, rt_slot_size
     global rt_slots_per_shard, rt_shard_size
     global rt_offset_len, rt_offset_type, rt_offset_val
+    global rt_entry_size, rt_node_max_keys
 
     rt_port             resq 1
     rt_key_size         resq 1
@@ -31,6 +32,9 @@ section .bss
     rt_offset_len       resq 1
     rt_offset_type      resq 1
     rt_offset_val       resq 1
+
+    rt_entry_size       resq 1      ; B+ Tree entry = key_size + 8-byte pointer
+    rt_node_max_keys    resq 1      ; (page_size - header_size) / entry_size
 
 section .text
     global init_runtime_config
@@ -101,6 +105,18 @@ recalc_offsets:
     mov [rt_slot_size], rbx      ; Otherwise, expand to minimum
 
 .done_recalc:
+    ; --- B+ TREE ENTRY GEOMETRY (dynamic key width) ---
+    ; entry = key_size + 8 (child/slot pointer). node_max_keys is recomputed
+    ; so the leaf split logic stays correct for any key geometry.
+    mov rax, [rt_key_size]
+    add rax, 8
+    mov [rt_entry_size], rax
+
+    mov rax, BTREE_PAGE_SIZE
+    sub rax, BTREE_HEADER_SIZE
+    xor rdx, rdx
+    div qword [rt_entry_size]
+    mov [rt_node_max_keys], rax
     ret
 
 ; --- Private: Load Defaults ---
