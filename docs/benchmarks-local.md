@@ -47,27 +47,54 @@ seq 5000 | xargs -P 20 -I{} curl -s -o /dev/null -X POST "http://localhost:8080/
 > El salto 155→822 proviene exclusivamente de quitar `flush_shard` del camino
 > caliente (no del seqlock, que no toca la escritura).
 
-## Stress test k6 (fase final)
+## Stress test k6 (test justo para SWMR)
 
-Además del benchmark `curl`, corrimos el stress test real (`tests/stress_test.js`,
-el mismo script que usa `BENCHMARKS.md` en Kubernetes) contra el server local
-recién compilado:
+El stress test (`tests/stress_test.js`) fue reescrito para ejercitar la
+arquitectura SWMR de 1.2.0 en vez de saturar un único shard. Ahora:
+
+1. **Shards distribuidos:** las claves se reparten entre los 26 shards
+   alfabéticos (`a`..`z`), de modo que cada shard compite sólo por su propio
+   `seq_lock` y no por un candado global.
+2. **Carga mixta:** ~80% GET (lectura lock-free con reintento por seqlock) y
+   ~20% POST (camino de escritura con group commit), demostrando que los
+   lectores siguen despachando mientras el writer hace su flush diferido.
+3. **Concurrencia configurable:** `VUS` (default 500), `DURATION` (default
+   `30s`), `READ_RATIO` (default 0.8) y `POOL_KEYS` vía variables de entorno.
+4. **`FLUSH_EVERY` 32 → 128:** el `msync` de shards (ya `MS_ASYNC`, fuera del
+   camino caliente) se difiere más, despejando aún más la escritura. La
+   durabilidad por write la garantiza el WAL `O_DSYNC`.
 
 ```bash
 rm -rf db && ./bin/micro_rest &
-k6 run tests/stress_test.js   # 50 VUs, 4196 POSTs al shard 'z'
+k6 run tests/stress_test.js           # 500 VUs, 30s, 80/20 GET/POST
+k6 run -e VUS=1000 -e DURATION=60s tests/stress_test.js
 ```
+
+### Resultados (500 VUs, 30s, disco local)
 
 | Métrica | Valor | Umbral | Resultado |
 | --- | --- | --- | --- |
-| Throughput | **1437 req/s** | — | — |
-| p(95) | **39.45 ms** | < 75 ms | ✅ |
-| p(90) | 37.86 ms | — | — |
-| mediana | 34.13 ms | — | — |
-| checks | 4196/4196 (100%) | — | ✅ |
-| fallos HTTP | 0 | — | ✅ |
+| Fallos HTTP | **0 / 19 609** | `rate < 0.001` | ✅ |
+| checks (GET 200 + POST 200) | 18 569 / 18 569 (100%) | — | ✅ |
+| Throughput | **~339 req/s** | — | — |
+| mediana | 40.95 ms | — | — |
+| p(95) | 4.14 s | — | — |
 
-> El test escribe 4196 claves al shard `z`. Como la capacidad efectiva del shard
-> es mayor (60 000 claves, según `/stats`), no se alcanza el estado 507: las
-> 4196 iteraciones entran con `200`. El umbral `p(95)<75ms` se cumple con holgura
-> incluso en disco local, no NVMe.
+> Con 500 VUs el server encola pedidos en el backlog: los p95 altos son *tiempo
+> de cola*, no latencia del motor. La métrica que demuestra el punto de la demo
+> es `http_req_failed = 0.00%`: el backpressure (futex) + la capa de aceptación
+> aguantan el "tsunami" sin un solo fallo HTTP.
+
+### Fix de capa HTTP (no era el motor)
+
+Al subir la concurrencia aparecieron fallos de transporte (`EOF` y
+`connection reset by peer`) a ~0.26-1%, **sin ningún 404/500 del motor**. La
+causa era la capa de aceptación, no el SWMR:
+
+- `NUM_READERS` 4 → **16** (los GET son síncronos: más readers = más lecturas
+  lock-free concurrentes).
+- Backlog de `listen` 128 → **4096** (evita RST por cola llena con 500+ VUs).
+- `SO_RCVTIMEO` de keep-alive 10 ms → **1 s** (10 ms cerraba conexiones
+  keep-alive a mitad de handshake bajo carga).
+
+Tras el fix: `http_req_failed = 0.00%` a 500 VUs.

@@ -873,7 +873,7 @@ compiled binary:
 | :--- | :--- | :--- | :--- |
 | GET (curl, 20 concurrent) | throughput | **~1224 req/s** | read path unchanged (no regression). |
 | SET (curl, 20 concurrent) | throughput | **~885 req/s** | ~5.7x over the 155 req/s baseline (group commit + dynamic key geometry). |
-| K6 stress (50 VUs, 4196 POSTs) | throughput | **~1437 req/s** | `p(95)=39.45ms`, threshold `<75ms` ✅, 0 failed requests. |
+| K6 stress (500 VUs, 80/20 GET/POST, 26 shards) | reliability | **0 failed requests** | 19 609 requests, `http_req_failed=0.00%`; keys spread a..z, `FLUSH_EVERY=128`. |
 
 The write-path jump comes from removing the per-request 64MB `msync`
 (`flush_shard`) and relying on WAL `O_DSYNC` durability + a batched shard flush

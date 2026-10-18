@@ -22,7 +22,11 @@ extern flush_all_shards     ; 🛡️ GROUP COMMIT: batch msync of all shards
 %define QUEUE_CAPACITY  64
 %define QUEUE_MASK      63
 %define JOB_SIZE        8208
-%define FLUSH_EVERY     32        ; group-commit: msync shards every N writes
+%define FLUSH_EVERY     128       ; group-commit: msync shards every N writes (MS_ASYNC).
+                                  ; Durability per-write is already guaranteed by the O_DSYNC WAL;
+                                  ; raising this only defers the (now non-blocking) shard writeback,
+                                  ; so a higher N keeps the hot write path clear longer. If the
+                                  ; process dies between flushes, dirty pages are replayed from WAL.
 
 section .data
     ; struct timespec { tv_sec; tv_nsec } — RELATIVE timeout for FUTEX_WAIT.

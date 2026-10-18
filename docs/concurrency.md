@@ -126,7 +126,10 @@ pasan.
   caliente. La durabilidad de cada write la garantiza el WAL abierto con
   `O_DSYNC` (flag `0x1442` en `main.asm`).
 - `src/core/worker.asm`: el writer thread hace flush batch cada `FLUSH_EVERY`
-  (32) writes vía `flush_all_shards`.
+  (128) writes vía `flush_all_shards` (MS_ASYNC). El umbral se subió de 32 a 128
+  para el benchmark de estrés: con el msync ya fuera del camino caliente y
+  no-bloqueante, aplazarlo más despeja aún más la escritura. La durabilidad de
+  cada write la sigue garantizando el WAL `O_DSYNC`.
 
 Resultado medido: **SET 155 → 822 req/s (~5.3x)**. El WAL `O_DSYNC` por write
 sigue siendo el próximo cuello de botella de escritura (candidato a group

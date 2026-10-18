@@ -7,7 +7,10 @@
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 
-%define NUM_READERS     4           ; reader threads (parent + 3 children)
+%define NUM_READERS     16          ; reader threads (parent + 15 children).
+                                    ; GET is served synchronously by a reader, so more
+                                    ; readers = more concurrent lock-free reads under load.
+                                    ; TLS blocks and stacks are allocated parametrically.
 %define READER_STACK    65536       ; stack size per child reader thread
 
 ; --- External Engine Modules ---
@@ -41,7 +44,9 @@ section .data
     act_ignore   dq 1, 0, 0, 0  ; SIG_IGN for SIGPIPE
 
     ; struct timeval { time_t tv_sec; suseconds_t tv_usec; }
-    tv_timeout   dq 0, 10000        ; 10 milliseconds timeout for Keep-Alive sockets
+    tv_timeout   dq 1, 0            ; 1 second timeout for Keep-Alive sockets.
+                                    ; 10ms was too aggressive: under high VU load it closed
+                                    ; idle keep-alive connections mid-handshake (EOF/RST).
     keep_alive_str db "keep-alive"
 
     ; Flags for sys_clone: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
@@ -179,7 +184,7 @@ _start:
 
     mov rax, 50                 ; sys_listen
     mov rdi, [server_fd]
-    mov rsi, 128                ; Increased backlog for high-concurrency
+    mov rsi, 4096               ; Backlog: keep 500+ VUs queued instead of RST on overflow
     syscall
 
     mov rdi, 1

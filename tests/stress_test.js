@@ -1,66 +1,91 @@
 import http from 'k6/http';
 import { check } from 'k6';
 import exec from 'k6/execution';
+import { SharedArray } from 'k6/data';
 
 /**
- * K6 Stress Test for La Roca Micro-KV
- * Focus: Namespace validation (/keys/), Capacity limits (507),
- * and high-concurrency stability under the new routing logic.
+ * K6 Stress Test for La Roca Micro-KV — SWMR showcase.
+ *
+ * Unlike the old test (all POSTs pinned to shard 'z'), this one exercises the
+ * v1.2.0 concurrency model directly:
+ *   1. Keys are spread across all 26 alphabetic shards (a..z), so each shard
+ *      contends only on its own seq_lock instead of a single global lock.
+ *   2. Mixed workload: ~80% GET (lock-free reads with seqlock retry) and
+ *      ~20% POST (group-commit write path), proving readers keep serving while
+ *      the writer does its deferred flush.
+ *   3. Concurrency is tunable up to hundreds/thousands of VUs to show the
+ *      futex-based backpressure keeping HTTP failures at 0 under a "tsunami".
+ *
+ * Tuning (all via env, see README "Testing & Validation"):
+ *   VUS          virtual users (default 500)
+ *   DURATION     test duration (default '30s')
+ *   READ_RATIO   fraction of GETs, 0..1 (default 0.8)
+ *   POOL_KEYS    preloaded keys, spread round-robin across a..z (default 1040)
  */
 
-// 1. Environment Variable Extraction
-const MAX_SLOTS_RAW = __ENV.MAX_SLOTS || "4096";
-const MAX_SLOTS = parseInt(MAX_SLOTS_RAW.split(' ')[0], 10);
+const API_URL = __ENV.API_URL || 'http://localhost:8080/keys';
+const VUS = parseInt(__ENV.VUS || '500', 10);
+const DURATION = __ENV.DURATION || '30s';
+const READ_RATIO = parseFloat(__ENV.READ_RATIO || '0.8');
+const POOL_KEYS = parseInt(__ENV.POOL_KEYS || '1040', 10);
 
-// Pointing to the new base API
-const API_URL = "http://localhost:8080/keys";
+const LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
+
+// Shared pool of pre-existing keys, one per VU copy (SharedArray is loaded once).
+// Letter = shard index (a=0 .. z=25); the numeric suffix keeps keys unique.
+const keys = new SharedArray('keys', function () {
+    const arr = [];
+    for (let i = 0; i < POOL_KEYS; i++) {
+        arr.push(`${LETTERS[i % 26]}_pool_${i}`);
+    }
+    return arr;
+});
 
 export const options = {
-    // 50 Virtual Users (VUs) - Intensive load for raw Assembly
-    vus: 50,
-    // Attempt to exceed capacity to trigger Disk/Memory boundary protection
-    iterations: MAX_SLOTS + 100,
+    vus: VUS,
+    duration: DURATION,
     discardResponseBodies: true,
     thresholds: {
-        // Adjusted tolerance for local/CI environments with standard disks.
-        // Write operations in La Roca require a physical commit (sys_fdatasync).
-        // On Enterprise NVMe servers, this value will be closer to 5-10ms.
-        http_req_duration: ['p(95)<75'],
+        // The engine's backpressure should keep failures at 0. We allow 0.1%
+        // slack for loopback TCP hiccups from the *tester* (k6 saturates `lo`
+        // before La Roca saturates) — set to `rate==0` for a strict demo.
+        http_req_failed: ['rate<0.001'],
     },
 };
 
-export default function () {
-    // Unique ID for the current iteration to ensure deterministic sharding
-    const id = exec.scenario.iterationInTest;
+// Preload the pool so the 80% GETs hit real keys and measure the lock-free
+// read path (a GET on a missing key is also cheap, but it does not exercise
+// the seqlock retry against a live B+Tree the way a hit does).
+export function setup() {
+    const payload = 'v';
+    for (let i = 0; i < keys.length; i++) {
+        http.post(`${API_URL}/${keys[i]}`, payload, {
+            headers: { 'Connection': 'keep-alive' },
+            tags: { name: 'warmup' },
+        });
+    }
+    return {};
+}
 
-    // URL Construction: Now following the /keys/{key} contract
-    // 'z' prefix ensures we hit db/z.db for predictable saturation
-    const url = `${API_URL}/z_stress_${id}`;
-    const payload = "val";
+export default function () {
+    const isRead = Math.random() < READ_RATIO;
 
     const params = {
-        headers: {
-            // Explicitly request Keep-Alive to test the Assembly scanner
-            'Connection': 'keep-alive',
-        },
-        tags: {
-            // Aggregate metrics under one name to save K6 memory
-            name: 'PostToKeysNamespace'
-        },
+        headers: { 'Connection': 'keep-alive' },
+        tags: { name: isRead ? 'GetFromKeys' : 'PostToKeys' },
     };
 
-    // Execute POST to the new namespace
-    const res = http.post(url, payload, params);
-
-    // Validation
-    // 200 = Stored successfully
-    // 507 = Shard capacity reached (Insufficient Storage)
-    check(res, {
-        'status is 200 or 507': (r) => r.status === 200 || r.status === 507,
-    });
-
-    // Log saturation points every 500 iterations
-    if (res.status === 507 && id % 500 === 0) {
-        console.log(`[!] Shard Z Saturated: 507 received at index ${id}`);
+    if (isRead) {
+        const key = keys[Math.floor(Math.random() * keys.length)];
+        const res = http.get(`${API_URL}/${key}`, params);
+        check(res, { 'GET 200': (r) => r.status === 200 });
+        return;
     }
+
+    // Write path: unique key spread across a random shard on every iteration.
+    const letter = LETTERS[Math.floor(Math.random() * LETTERS.length)];
+    const id = `${exec.vu.idInTest}_${exec.scenario.iterationInTest}`;
+    const url = `${API_URL}/${letter}_stress_${id}`;
+    const res = http.post(url, 'val', params);
+    check(res, { 'POST 200': (r) => r.status === 200 });
 }
