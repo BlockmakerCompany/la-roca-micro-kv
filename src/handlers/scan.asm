@@ -11,8 +11,11 @@
 extern btree_search
 extern compare_keys
 extern get_shard_ptr
+extern get_shard_index      ; 🛡️ Shard index for per-shard seqlock
+extern shard_seq_read       ; 🛡️ Seqlock reader snapshot
+extern rt_key_size
+extern rt_entry_size
 extern handle_400, handle_404, close_socket
-extern q_prefix, q_startkey, q_limit
 extern parse_query_params
 
 section .data
@@ -50,7 +53,8 @@ handle_scan:
     call parse_query_params
 
     ; --- 2. B+ TREE LEAF JUMP ---
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     cmp byte [rsi], 0
     je .err_bad_req
 
@@ -59,11 +63,23 @@ handle_scan:
     jz .err_not_found
     mov r12, rdx                ; R12 = Shard Base Pointer
 
-    lea rsi, [q_startkey]
+    ; Resolve shard index for the per-shard seqlock
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
+    call get_shard_index
+    mov [rbp-16], rax           ; [rbp-16] = shard index
+
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_STARTKEY]
     cmp byte [rsi], 0
     jne .do_jump
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
 .do_jump:
+    ; Seqlock barrier: never traverse the tree while a split/rebalance is live.
+    mov rdi, [rbp-16]
+    call .seq_wait
+
     mov rdi, r12
     call btree_search           ; RAX = Offset of the Leaf Node
     test rax, rax
@@ -78,8 +94,8 @@ handle_scan:
     je .start_harvest           ; If not found, start harvesting in the next leaf
 
     mov rax, r8
-    imul rax, 40                ; ENTRY_SIZE
-    lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey
+    imul rax, [rt_entry_size]
+    lea rdi, [r13 + 19 + rax]   ; RDI = LeafKey (19 = HEADER_SIZE)
 
     ; RSI already contains the preserved Search Key
     call compare_keys
@@ -100,7 +116,7 @@ handle_scan:
 
     ; --- 5. HARVEST LOOP (B+ Tree Linked List) ---
     xor r14, r14                ; R14 = Results counter
-    mov r15d, [q_limit]
+    mov r15d, [fs:TLS_Q_LIMIT]
     test r15d, r15d
     jnz .leaf_loop
     mov r15d, 50                ; Default limit
@@ -113,7 +129,7 @@ handle_scan:
     jae .next_leaf              ; If keys are exhausted, jump to the next leaf
 
     mov rax, r8
-    imul rax, 40
+    imul rax, [rt_entry_size]
     lea rbx, [r13 + 19 + rax]   ; RBX = Pointer to the current key
 
     ; --- TELEMETRY (STDOUT) ---
@@ -124,7 +140,7 @@ handle_scan:
     syscall
     mov rax, 1
     mov rsi, rbx
-    mov rdx, 32
+    mov rdx, [rt_key_size]
     syscall
     mov rax, 1
     lea rsi, [newline]
@@ -132,7 +148,8 @@ handle_scan:
     syscall
 
     ; --- PREFIX VALIDATION ---
-    lea rsi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_Q_PREFIX]
     mov rdi, rbx
     call .check_prefix
     test rax, rax
@@ -150,6 +167,10 @@ handle_scan:
     jmp .key_loop
 
 .next_leaf:
+    ; Seqlock barrier before following the NEXT pointer (avoids torn links).
+    mov rdi, [rbp-16]
+    call .seq_wait
+
     mov rax, [r13 + 11]         ; Read NODE_OFFSET_NEXT
     test rax, rax
     jz .finish_with_close       ; If 0, end of Shard reached
@@ -184,6 +205,20 @@ handle_scan:
     ret
 
 ; --- Helpers ---
+; .seq_wait: Spin until the shard seqlock is even (no writer in progress).
+; Input: RDI = shard index (0-26). Clobbers RAX.
+.seq_wait:
+    push rax
+.w_loop:
+    call shard_seq_read
+    test al, 1
+    jz .w_done
+    pause
+    jmp .w_loop
+.w_done:
+    pop rax
+    ret
+
 .send_trimmed_key:
     mov rsi, rbx
     xor rdx, rdx
@@ -191,7 +226,7 @@ handle_scan:
     cmp byte [rsi + rdx], 0
     je .tw
     inc rdx
-    cmp rdx, 32
+    cmp rdx, [rt_key_size]
     je .tw
     jmp .tl
 .tw:
@@ -223,9 +258,10 @@ handle_scan:
     ret
 
 .clear_query_buffers:
-    lea rdi, [q_prefix]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_Q_PREFIX]
     xor rax, rax
     mov rcx, 16
     rep stosq
-    mov dword [q_limit], 0
+    mov dword [fs:TLS_Q_LIMIT], 0
     ret

@@ -32,4 +32,4 @@ services:
 
     # Set to 'no' so the test runner (test_recovery.sh) maintains
     # exclusive control over the container resurrection logic.
-    restart: no
+    restart: "no"

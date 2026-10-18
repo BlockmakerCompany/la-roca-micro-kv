@@ -46,6 +46,7 @@ run_suite "tests/test_engine.sh"             "Functional CRUD & B-Tree Suite"
 run_suite "tests/test_recovery.sh"           "WAL & Fault Recovery"
 run_suite "tests/test_security.sh"           "Security Hardening & Protocol"
 run_suite "tests/test_concurrency.sh"        "Atomic Concurrency & Race Conditions"
+run_suite "tests/test_consistency.sh"        "SWMR Consistency (GET returns only real values)"
 
 # --- 2. Optional Stress Testing (K6) ---
 if [[ "$1" == "--stress" ]]; then

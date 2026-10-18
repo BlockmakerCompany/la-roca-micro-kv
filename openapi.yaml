@@ -2,7 +2,7 @@ openapi: 3.0.0
 info:
   title: "⚡ Micro-Minimum-Useless: Key-Value Edition"
   description: "Ultra-minimalist x86_64 Assembly KV Store with deterministic sharding."
-  version: "1.1.0"
+  version: "1.2.0"
 
 servers:
   - url: http://localhost:8080

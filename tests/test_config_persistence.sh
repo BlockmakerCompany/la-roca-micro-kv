@@ -10,7 +10,7 @@
 
 # --- Environment Pre-flight ---
 PORT=8086
-IMAGE_NAME="blockmaker/la-roca-kv:1.1.0"
+IMAGE_NAME="blockmaker/la-roca-kv:1.2.0"
 
 TEST_DIR="$(pwd)/asm_kv_config_test_$$"
 # Keys for testing (Note: No leading slash here, handled by the API path)
@@ -21,10 +21,10 @@ TEST_VAL="Data_protected_by_disk_authority"
 COLLISION_VAL="User_data_named_stats"
 
 INITIAL_SLOT_SIZE=2048
-INITIAL_KEY_SIZE=64
+INITIAL_KEY_SIZE=24
 
 POISON_SLOT_SIZE=4096
-POISON_KEY_SIZE=128
+POISON_KEY_SIZE=32
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'

@@ -4,19 +4,15 @@
 ; Responsibility: B+ Tree with Mega-Pages (256KB) and 2-Level Split Logic.
 ; -----------------------------------------------------------------------------
 
-%define PAGE_SIZE 262144    ; 🛡️ 256KB HugePage for extreme cache locality
+%define PAGE_SIZE BTREE_PAGE_SIZE    ; 🛡️ 256KB HugePage for extreme cache locality
 %define PTR_SIZE 8
-%define MAX_KEY_SIZE 32
 
-; --- NODE LAYOUT ---
+; --- NODE LAYOUT (fixed; entry width is dynamic via rt_key_size) ---
 %define NODE_OFFSET_TYPE     0
 %define NODE_OFFSET_KEYS     1
 %define NODE_OFFSET_PARENT   3
 %define NODE_OFFSET_NEXT     11
-%define HEADER_SIZE          19
-
-%define NODE_MAX_KEYS        6553   ; (262144 - 19) / 40
-%define ENTRY_SIZE           40
+%define HEADER_SIZE          BTREE_HEADER_SIZE
 
 %include "config.inc"
 
@@ -26,6 +22,8 @@ extern rt_val_max_size
 extern rt_offset_len
 extern rt_offset_type
 extern rt_offset_val
+extern rt_entry_size
+extern rt_node_max_keys
 extern compare_keys
 
 section .text
@@ -80,7 +78,7 @@ btree_search:
     jge .follow_rightmost_ptr
 
     mov r8, r12
-    imul r8, ENTRY_SIZE
+    imul r8, [rt_entry_size]
     lea r9, [rbx + HEADER_SIZE + r8]
 
     push rdi
@@ -100,17 +98,19 @@ btree_search:
     dec r12
 .follow_current_ptr:
     mov r8, r12
-    imul r8, ENTRY_SIZE
+    imul r8, [rt_entry_size]
     lea r9, [rbx + HEADER_SIZE + r8]
-    mov rax, [r9 + MAX_KEY_SIZE]
+    add r9, [rt_key_size]           ; Pointer sits right after the key
+    mov rax, [r9]
     jmp .traverse_loop
 
 .follow_rightmost_ptr:
     mov r8, rcx
     dec r8
-    imul r8, ENTRY_SIZE
+    imul r8, [rt_entry_size]
     lea r9, [rbx + HEADER_SIZE + r8]
-    mov rax, [r9 + MAX_KEY_SIZE]
+    add r9, [rt_key_size]
+    mov rax, [r9]
     jmp .traverse_loop
 
 .found_leaf:
@@ -171,7 +171,7 @@ btree_insert:
 
     ; 4. Check Capacity
     movzx rcx, word [r8 + NODE_OFFSET_KEYS]
-    cmp rcx, NODE_MAX_KEYS
+    cmp rcx, [rt_node_max_keys]
     jae .trigger_split
 
     ; 5. Find Insertion Point
@@ -180,7 +180,7 @@ btree_insert:
     cmp r9, rcx
     je .shift_and_insert
     mov rax, r9
-    imul rax, ENTRY_SIZE
+    imul rax, [rt_entry_size]
     lea rdi, [r8 + HEADER_SIZE + rax]
     call compare_keys
     je .overwrite_existing
@@ -189,7 +189,8 @@ btree_insert:
     jmp .find_pos
 
 .overwrite_existing:
-    mov [rdi + MAX_KEY_SIZE], r12
+    mov rdx, [rt_key_size]
+    mov [rdi + rdx], r12
     mov rax, 1
     jmp .exit_insert
 
@@ -197,13 +198,17 @@ btree_insert:
     mov rax, rcx
     sub rax, r9
     jz .do_insert
-    imul rax, ENTRY_SIZE
-    mov r10, rax
+    mov r10, [rt_entry_size]    ; r10 = entry width
+    mov rdx, rax                ; rdx = (count - index) entries to shift
+    imul rdx, r10               ; rdx = bytes to move
     mov rax, rcx
-    imul rax, ENTRY_SIZE
-    lea rdi, [r8 + HEADER_SIZE + rax + ENTRY_SIZE - 8]
-    lea rsi, [r8 + HEADER_SIZE + rax - 8]
-    mov rcx, r10
+    imul rax, r10               ; rax = tail offset = count * entry_size
+    lea rdi, [r8 + HEADER_SIZE + rax]
+    add rdi, r10
+    sub rdi, 8                  ; dest = tail + entry_size - 8
+    lea rsi, [r8 + HEADER_SIZE + rax]
+    sub rsi, 8                  ; src  = tail - 8
+    mov rcx, rdx
     shr rcx, 3
     std
     rep movsq
@@ -211,10 +216,10 @@ btree_insert:
 
 .do_insert:
     mov rax, r9
-    imul rax, ENTRY_SIZE
+    imul rax, [rt_entry_size]
     lea rdi, [r8 + HEADER_SIZE + rax]
     mov rsi, r14
-    mov rcx, MAX_KEY_SIZE
+    mov rcx, [rt_key_size]
     rep movsb
     mov [rdi], r12
 
@@ -228,24 +233,32 @@ btree_insert:
 
 .trigger_split:
     ; -------------------------------------------------------------
-    ; B+ TREE 2-LEVEL SPLIT (Mega-Page Mode)
+    ; B+ TREE 2-LEVEL SPLIT (Mega-Page Mode, dynamic entry width)
     ; -------------------------------------------------------------
     ; Allocate Sibling
     mov rcx, PAGE_SIZE
     call _bump_alloc
-    mov r10, rax
-    lea r11, [r13 + r10]
+    mov r10, rax                 ; r10 = sibling page offset
+    lea r11, [r13 + r10]         ; r11 = sibling page address
 
     mov byte [r11 + NODE_OFFSET_TYPE], 1
     mov qword [r11 + NODE_OFFSET_PARENT], 0
 
-    ; Split keys (6553 keys total -> 3277 Old, 3276 New)
-    mov word [r8 + NODE_OFFSET_KEYS], 3277
-    mov word [r11 + NODE_OFFSET_KEYS], 3276
+    ; Split counts: old keeps ceil(N/2), new gets floor(N/2)
+    mov rax, [rt_node_max_keys]
+    mov rdx, rax
+    shr rdx, 1                   ; rdx = new_count = N/2
+    sub rax, rdx                 ; rax = old_count = N - N/2
+    mov word [r8 + NODE_OFFSET_KEYS], ax
+    mov word [r11 + NODE_OFFSET_KEYS], dx
 
-    lea rsi, [r8 + HEADER_SIZE + 3277 * ENTRY_SIZE]
+    ; Copy second half of entries to the sibling leaf
+    mov r15, rax                 ; r15 = old_count (value ptr no longer needed)
+    imul r15, [rt_entry_size]    ; r15 = byte offset of the split point
+    lea rsi, [r8 + HEADER_SIZE + r15]
     lea rdi, [r11 + HEADER_SIZE]
-    mov rcx, 3276 * ENTRY_SIZE
+    mov rcx, rdx                 ; rcx = new_count
+    imul rcx, [rt_entry_size]    ; rcx = bytes to copy
     cld
     rep movsb
 
@@ -268,17 +281,18 @@ btree_insert:
     mov [r8 + NODE_OFFSET_PARENT], r9
     mov [r11 + NODE_OFFSET_PARENT], r9
 
-    ; Link Old Leaf
+    ; Link Old Leaf (routing key + old leaf offset)
     lea rsi, [r8 + HEADER_SIZE]
     lea rdi, [r13 + r9 + HEADER_SIZE]
-    mov rcx, MAX_KEY_SIZE
+    mov rcx, [rt_key_size]
     rep movsb
-    mov [rdi], rbx
+    mov [rdi], rbx               ; rbx = old leaf offset (still intact)
 
-    ; Link New Leaf
+    ; Link New Leaf (routing key + new leaf offset)
     lea rsi, [r11 + HEADER_SIZE]
-    lea rdi, [r13 + r9 + HEADER_SIZE + ENTRY_SIZE]
-    mov rcx, MAX_KEY_SIZE
+    lea rdi, [r13 + r9 + HEADER_SIZE]
+    add rdi, [rt_entry_size]
+    mov rcx, [rt_key_size]
     rep movsb
     mov [rdi], r10
 
@@ -317,7 +331,7 @@ btree_delete:
     je .not_found
 
     mov rax, r9
-    imul rax, ENTRY_SIZE
+    imul rax, [rt_entry_size]
     lea rdi, [rbx + HEADER_SIZE + rax]
 
     push rsi
@@ -336,12 +350,13 @@ btree_delete:
     dec rax
     jz .update_counts
 
-    imul rax, ENTRY_SIZE
+    mov r13, [rt_entry_size]   ; r13 = entry width
+    imul rax, r13              ; rax = bytes to move
     mov r10, rax
     mov rax, r9
-    imul rax, ENTRY_SIZE
+    imul rax, r13              ; rax = index * entry_size
     lea rdi, [rbx + HEADER_SIZE + rax]
-    lea rsi, [rdi + ENTRY_SIZE]
+    lea rsi, [rdi + r13]       ; src = entry[index+1]
 
     mov rcx, r10
     cld

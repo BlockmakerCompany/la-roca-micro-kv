@@ -2,48 +2,38 @@
 ; Module: src/handlers/set.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: Hardened, binary-safe POST/SET handling.
-;                 Implements strict Content-Length validation, 411/413 error
-;                 handling, and supports HTTP Keep-Alive on success.
+;                 Implements Seqlock (Writer Side) and Memory Isolation
+;                 for safe SWMR asynchronous execution.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
 %include "responses.inc"
 
-; --- Telemetry Macro ---
+; --- Telemetry Macro (no-op) ---
 %macro DEBUG_LOG 1
-    section .data
-        %%msg db "[DEBUG:SET] ", %1, 0x0A
-        %%len equ $ - %%msg
-    section .text
-        push rax
-        push rdi
-        push rsi
-        push rdx
-        mov rax, 1
-        mov rdi, 1
-        lea rsi, [%%msg]
-        mov rdx, %%len
-        syscall
-        pop rdx
-        pop rsi
-        pop rdi
-        pop rax
 %endmacro
 
 extern handle_400, handle_507
 extern btree_insert, append_wal
-extern flush_shard
-extern validated_key
 extern rt_val_max_size
+extern rt_key_size
+extern get_shard_ptr        ; 🛡️ IMPORT: Shard resolution
+extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
+extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
 
 section .bss
+    ; tmp_val is sized to the max HTTP body read in one sys_read (8191 bytes).
+    ; The actual payload copied into it is bounded by rt_val_max_size (985,
+    ; the WAL value area) via the 413 check during Content-Length parsing, so
+    ; this buffer is always comfortably larger than what can legally arrive.
     tmp_val    resb 8192
     tmp_v_len  resw 1
+    writer_key resb 256         ; 🛡️ ISOLATION: Dedicated key buffer for Writer Thread
 
 section .text
     global handle_set
 
 handle_set:
-    DEBUG_LOG "Initializing SET handler..."
+    DEBUG_LOG "Initializing SET handler (Writer Thread)..."
     push rbp
     mov rbp, rsp
     push rbx
@@ -52,15 +42,54 @@ handle_set:
     push r14
     push r15
 
-    mov r12, rdi                ; Shard
+    cld
+    ; In the SWMR architecture, the worker queue passes:
+    ; RDX = Socket FD, RSI = Raw Request Buffer
     mov r13, rdx                ; Socket FD
     mov r14, rsi                ; Request Buffer
 
+    ; =========================================================================
+    ; 0. KEY EXTRACTION & SHARD RESOLUTION (Writer-Owned)
+    ; =========================================================================
+    lea rsi, [r14 + 11]         ; Skip "POST /keys/" (11 bytes)
+
+    ; Clean writer_key buffer (32 QWORDs = 256 bytes)
+    lea rdi, [writer_key]
+    xor rax, rax
+    mov rcx, 32
+    rep stosq
+
+    ; Extract Key
+    lea rdi, [writer_key]
+    lea rsi, [r14 + 11]
+    xor rcx, rcx
+.ext_loop:
+    lodsb
+    cmp al, ' '                 ; Space before HTTP/1.1
+    je .ext_done
+    test al, al
+    jz .ext_done
+    inc rcx
+    cmp rcx, [rt_key_size]      ; Hard limit (dynamic geometry)
+    jae .err_400
+    stosb
+    jmp .ext_loop
+
+.ext_done:
+    test rcx, rcx
+    jz .err_404
+
+    ; Resolve the Shard based on writer_key
+    lea rsi, [writer_key]
+    call get_shard_ptr
+    mov r12, rdx                ; r12 = Target Shard Pointer
+
+    ; =========================================================================
     ; 1. Buffer Sanitization
+    ; =========================================================================
     lea rdi, [tmp_val]
     xor al, al
     mov rcx, 8192
-    cld
     rep stosb
 
     ; 2. Content-Length Header Parsing
@@ -141,34 +170,66 @@ handle_set:
     rep movsb
 
 .do_ins:
-    DEBUG_LOG "Persisting to WAL and B-Tree..."
+    DEBUG_LOG "Persisting to WAL..."
     mov rdi, 1
-    lea rsi, [validated_key]
+    lea rsi, [writer_key]
     lea rdx, [tmp_val]
     movzx rcx, word [tmp_v_len]
+    push r12                    ; 🛡️ Save Shard Pointer (R12)
     call append_wal
+    pop r12
+
+    ; =========================================================================
+    ; 🛡️ OPTIMISTIC CONCURRENCY: SEQLOCK WRITER BOUNDARY
+    ; =========================================================================
+    DEBUG_LOG "Acquiring Seqlock & Inserting to B-Tree..."
+
+    ; Resolve shard index for the per-shard seqlock (RBX survives btree_insert)
+    lea rsi, [writer_key]
+    call get_shard_index
+    mov rbx, rax
+
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE BEGIN: +1 (ODD -> readers spin/retry)
 
     mov rdi, r12
-    lea rsi, [validated_key]
+    lea rsi, [writer_key]
     lea rdx, [tmp_val]
     movzx rcx, word [tmp_v_len]
+    push r12                    ; 🛡️ Save Shard Pointer before insert
     call btree_insert
+    pop r12
+    push rax                    ; Save insertion result
+
+    mov rdi, rbx
+    call shard_seq_inc          ; WRITE END: +1 (EVEN -> readers can proceed)
+    ; =========================================================================
+
+    pop rax                     ; Restore insertion result
     test rax, rax
     jz .err_full
 
-    call flush_shard
+    ; 🛡️ GROUP COMMIT: no per-request msync here. Durability is guaranteed by
+    ; the O_DSYNC WAL (append_wal above); the shard mmap is synced in batch by
+    ; the writer thread (see worker.asm / flush_all_shards).
     DEBUG_LOG "Transaction committed. Sending 200 OK..."
 
     mov rax, 1
     mov rdi, r13
-    lea rsi, [hdr_200_stored]   ; Must include "Connection: keep-alive" in responses.inc
+    lea rsi, [hdr_200_stored]
     mov rdx, len_200_stored
     syscall
 
-    ; 🛡️ CRITICAL FIX: Bypass the sys_close block on success
-    jmp .finish_with_keepalive
+    ; 🛡️ CRITICAL FIX: The Writer Thread owns the socket and MUST close it.
+    jmp .finish_with_close
 
 ; --- Error Handlers ---
+
+.err_400:
+    DEBUG_LOG "Error 400: Invalid or too long key."
+    mov rdi, r13
+    call handle_400             ; handle_400 already closes the socket
+    jmp .finish
 
 .err_411:
     DEBUG_LOG "Error 411: Missing Content-Length."
@@ -191,17 +252,19 @@ handle_set:
 .err_bad:
     DEBUG_LOG "Error 400: Bad Request."
     mov rdi, r13
-    call handle_400
-    jmp .finish_with_close
+    call handle_400             ; handle_400 already closes the socket
+    jmp .finish
+
+.err_404:
+    DEBUG_LOG "Error 404: Empty Key."
+    mov rdi, r13
+    call handle_400             ; Treat malformed/empty key as 400 in POST; already closes
+    jmp .finish
 
 .err_full:
     DEBUG_LOG "Error 507: Shard capacity reached."
     mov rdi, r13
-    call handle_507
-    jmp .finish_with_close
-
-.finish_with_keepalive:
-    DEBUG_LOG "Keeping client socket open for Keep-Alive."
+    call handle_507             ; handle_507 already closes the socket
     jmp .finish
 
 .finish_with_close:

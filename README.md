@@ -93,11 +93,11 @@ The engine's capacity, memory footprint, and payload limits are completely modul
 ```nasm
 ; --- src/config.inc ---
 %define KEY_SIZE        32              ; Max bytes for a key (including null-terminator)
-%define VAL_MAX_SIZE    989             ; Max bytes for the binary payload
+%define VAL_MAX_SIZE    985             ; Max bytes for the binary payload (CRC32 padding reserved)
 %define SLOT_SIZE       1024            ; Total bytes per record (1KB)
 %define SLOTS_PER_SHARD 65536           ; Total records per shard
 %define SHARD_SIZE      67108864        ; 64MB per shard (SLOT_SIZE * SLOTS_PER_SHARD)
-%define WAL_RECORD_SIZE 1027            ; Bytes per WAL entry: OP(1) + LEN(2) + KEY(32) + VAL(992)
+%define WAL_RECORD_SIZE 1024            ; Bytes per WAL entry: CRC32(4) + OP(1) + LEN(2) + KEY(32) + VAL(985)
 ```
 
 #### 🛠️ How to Modify and Scale
@@ -222,7 +222,7 @@ Instead of a single monolithic file, the engine implements a **Deterministic Sha
     * **Key Field**: 32 bytes (null-padded).
     * **Length Field**: 2 bytes (`uint16` storing the exact payload size).
     * **Type Field**: 1 byte (Status flag, e.g., active/deleted).
-    * **Value Field**: 989 bytes of raw binary data.
+    * **Value Field**: 985 bytes of raw binary data.
 * **Addressing Formula**:
   $$Address(index) = BaseAddress + 256 + (index \times 1024)$$
 
@@ -505,11 +505,11 @@ services:
       - "80:8080"
 
   node-1:
-    image: blockmaker/la-roca-kv:1.1.0
+    image: blockmaker/la-roca-kv:1.2.0
     volumes: ["./data/n1:/app/db"]
 
   node-2:
-    image: blockmaker/la-roca-kv:1.1.0
+    image: blockmaker/la-roca-kv:1.2.0
     volumes: ["./data/n2:/app/db"]
 ```
 
@@ -684,9 +684,9 @@ Records are stored sequentially in an append-only fashion. Every key-value pair 
 | Offset (Inside Slot) | Size | Content | Technical Detail |
 | :--- | :--- | :--- | :--- |
 | `+0` | 32 B | **Key** | Raw ASCII/Binary key (null-padded). |
-| `+32` | 2 B | **Length** | `uint16` storing the exact payload size (0-989). |
+| `+32` | 2 B | **Length** | `uint16` storing the exact payload size (0-985). |
 | `+34` | 1 B | **Status/Type** | `0x01` for Active. |
-| `+35` | 989 B | **Value** | Raw binary payload (Binary-Safe). |
+| `+35` | 985 B | **Value** | Raw binary payload (Binary-Safe). |
 
 #### 🧮 How Addressing Works Now
 Unlike standard flat-array databases, you cannot guess a record's physical address by its alphabetical index.
@@ -701,10 +701,11 @@ The `wal.log` file is a sequential stream of atomic records. To maintain maximum
 
 | Offset | Size | Field | Description |
 | :--- | :--- | :--- | :--- |
-| `0x00` | 1 B | **Opcode** | `0x01` (SET/UPDATE) or `0x02` (DELETE). |
-| `0x01` | 2 B | **DataLen** | Exact length of the following value. |
-| `0x03` | 32 B | **Key** | The key involved in the operation. |
-| `0x23` | 989 B | **Value** | The raw payload (ignored during DELETE). |
+| `0x00` | 4 B | **CRC32** | Hardware checksum (SSE4.2) over bytes 4–1023. |
+| `0x04` | 1 B | **Opcode** | `0x01` (SET/UPDATE) or `0x02` (DELETE). |
+| `0x05` | 2 B | **DataLen** | Exact length of the following value. |
+| `0x07` | 32 B | **Key** | The key involved in the operation. |
+| `0x27` | 985 B | **Value** | The raw payload (ignored during DELETE). |
 
 > **Recovery Note:** During startup, the engine reads these 1KB blocks sequentially. If a read returns less than 1024 bytes, the engine assumes a partial write occurred during a crash and halts recovery to prevent corrupting the shards.
 
@@ -861,7 +862,24 @@ Ensures that runtime geometry (Key/Value sizes) and environment variables are co
 ---
 
 ### ⚡ Stress Testing & Benchmarking
-To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls. With Keep-Alive enabled, the engine consistently achieves **p(95) latencies under 1 millisecond**.
+To measure the raw power of the **Zero-Copy / No-LibC** architecture, we use direct Linux Kernel syscalls. With Keep-Alive enabled, **reads** consistently achieve **p(95) latencies under 1 millisecond**. **Writes** are bound by the durability guarantee (WAL `O_DSYNC` + `sys_fdatasync`), so their latency reflects the physical commit to disk.
+
+#### 📈 Measured Results (branch `feature/swmr-concurrency`)
+
+Local, on a development machine (no cgroups, no NVMe), against a freshly
+compiled binary:
+
+| Test | Metric | Result | Notes |
+| :--- | :--- | :--- | :--- |
+| GET (curl, 20 concurrent) | throughput | **~1224 req/s** | read path unchanged (no regression). |
+| SET (curl, 20 concurrent) | throughput | **~885 req/s** | ~5.7x over the 155 req/s baseline (group commit + dynamic key geometry). |
+| K6 stress (500 VUs, 80/20 GET/POST, 26 shards) | reliability | **0 failed requests** | 19 609 requests, `http_req_failed=0.00%`; keys spread a..z, `FLUSH_EVERY=128`. |
+
+The write-path jump comes from removing the per-request 64MB `msync`
+(`flush_shard`) and relying on WAL `O_DSYNC` durability + a batched shard flush
+(see `docs/concurrency.md`, Fase 3). The remaining 822→885 gain comes from the
+dynamic B+Tree key geometry. Full local numbers and methodology:
+`docs/benchmarks-local.md`.
 
 #### Modern Observability (K6)
 ```bash
