@@ -872,12 +872,13 @@ compiled binary:
 | Test | Metric | Result | Notes |
 | :--- | :--- | :--- | :--- |
 | GET (curl, 20 concurrent) | throughput | **~1224 req/s** | read path unchanged (no regression). |
-| SET (curl, 20 concurrent) | throughput | **~885 req/s** | ~5.7x over the 155 req/s baseline. |
+| SET (curl, 20 concurrent) | throughput | **~885 req/s** | ~5.7x over the 155 req/s baseline (group commit + dynamic key geometry). |
 | K6 stress (50 VUs, 4196 POSTs) | throughput | **~1437 req/s** | `p(95)=39.45ms`, threshold `<75ms` ✅, 0 failed requests. |
 
 The write-path jump comes from removing the per-request 64MB `msync`
 (`flush_shard`) and relying on WAL `O_DSYNC` durability + a batched shard flush
-(see `docs/concurrency.md`, Fase 3). Full local numbers and methodology:
+(see `docs/concurrency.md`, Fase 3). The remaining 822→885 gain comes from the
+dynamic B+Tree key geometry. Full local numbers and methodology:
 `docs/benchmarks-local.md`.
 
 #### Modern Observability (K6)

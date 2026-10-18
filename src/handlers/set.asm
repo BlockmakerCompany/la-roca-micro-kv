@@ -21,6 +21,10 @@ extern get_shard_index      ; 🛡️ IMPORT: Shard index for per-shard seqlock
 extern shard_seq_inc        ; 🛡️ IMPORT: Seqlock writer barrier
 
 section .bss
+    ; tmp_val is sized to the max HTTP body read in one sys_read (8191 bytes).
+    ; The actual payload copied into it is bounded by rt_val_max_size (985,
+    ; the WAL value area) via the 413 check during Content-Length parsing, so
+    ; this buffer is always comfortably larger than what can legally arrive.
     tmp_val    resb 8192
     tmp_v_len  resw 1
     writer_key resb 256         ; 🛡️ ISOLATION: Dedicated key buffer for Writer Thread
@@ -224,8 +228,8 @@ handle_set:
 .err_400:
     DEBUG_LOG "Error 400: Invalid or too long key."
     mov rdi, r13
-    call handle_400
-    jmp .finish_with_close
+    call handle_400             ; handle_400 already closes the socket
+    jmp .finish
 
 .err_411:
     DEBUG_LOG "Error 411: Missing Content-Length."
@@ -248,20 +252,20 @@ handle_set:
 .err_bad:
     DEBUG_LOG "Error 400: Bad Request."
     mov rdi, r13
-    call handle_400
-    jmp .finish_with_close
+    call handle_400             ; handle_400 already closes the socket
+    jmp .finish
 
 .err_404:
     DEBUG_LOG "Error 404: Empty Key."
     mov rdi, r13
-    call handle_400             ; Treat malformed/empty key as 400 in POST
-    jmp .finish_with_close
+    call handle_400             ; Treat malformed/empty key as 400 in POST; already closes
+    jmp .finish
 
 .err_full:
     DEBUG_LOG "Error 507: Shard capacity reached."
     mov rdi, r13
-    call handle_507
-    jmp .finish_with_close
+    call handle_507             ; handle_507 already closes the socket
+    jmp .finish
 
 .finish_with_close:
     DEBUG_LOG "Closing client socket."

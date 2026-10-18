@@ -105,6 +105,9 @@ productor/consumidor sobre futex:
 - Productor (`enqueue_job`): si la cola está llena, `FUTEX_WAIT` sobre
   `queue_head`; al enqueuar hace `FUTEX_WAKE` sobre `queue_tail`.
 - Consumidor hace `FUTEX_WAKE` sobre `queue_head` al liberar un slot.
+- Ambos `FUTEX_WAIT` son **acotados** (timeout de 1s): si el writer muriera, el
+  productor no queda colgado indefinidamente — al vencer el timeout abandona la
+  cola sin marcar el handoff, y el reader cierra el socket.
 
 Verificación: `test_engine.sh`, `test_consistency.sh`, `test_concurrency.sh`
 pasan.
@@ -117,7 +120,8 @@ pasan.
 **Estado Fase 3: IMPLEMENTADA.** Cambios:
 
 - `src/core/storage.asm`: nuevo `flush_all_shards` (recorre los 27 shards y hace
-  `msync` de cada uno). `flush_shard` sigue existiendo por compatibilidad.
+  `msync` con `MS_ASYNC` de cada uno, sin bloquear el writer). `flush_shard`
+  sigue existiendo por compatibilidad.
 - `src/handlers/set.asm` y `del.asm`: se eliminó el `msync` de 64MB del camino
   caliente. La durabilidad de cada write la garantiza el WAL abierto con
   `O_DSYNC` (flag `0x1442` en `main.asm`).
@@ -130,7 +134,11 @@ commit del fsync del WAL en una iteración futura).
 
 **Nota de durabilidad:** si el proceso muere entre dos flushes batch, las
 páginas sucias aún no sincronizadas a los shard files se reconstruyen desde el
-WAL en el arranque (`recover_from_wal`). No se pierde ningún write aceptado.
+WAL en el arranque (`recover_from_wal`). Para `ROCK_KEY_SIZE <= 32` no se pierde
+ningún write aceptado. Con `ROCK_KEY_SIZE > 32` el WAL (que guarda la clave en
+un campo fijo de 32 bytes) truncaría la clave y el recovery podría insertar una
+entrada espuria; por eso el arranque **rechaza** `ROCK_KEY_SIZE > 32` hasta que
+el WAL soporte geometría dinámica (follow-up).
 
 ### Fase 4 — Concurrencia del servidor
 

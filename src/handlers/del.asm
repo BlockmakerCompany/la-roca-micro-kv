@@ -114,8 +114,8 @@ handle_del:
 
 .err_404:
     mov rdi, r13
-    call handle_404             ; handle_404 already closes the socket
-    jmp .finish
+    call handle_404             ; handle_404 responds but does NOT close (keep-alive)
+    jmp .finish_with_close      ; writer owns the socket: close it explicitly
 
 .finish_with_close:
     mov rax, 3

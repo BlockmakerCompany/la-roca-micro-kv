@@ -24,6 +24,12 @@ extern flush_all_shards     ; 🛡️ GROUP COMMIT: batch msync of all shards
 %define JOB_SIZE        8208
 %define FLUSH_EVERY     32        ; group-commit: msync shards every N writes
 
+section .data
+    ; struct timespec { tv_sec; tv_nsec } — RELATIVE timeout for FUTEX_WAIT.
+    ; Bounds the producer's wait on a full queue (so a dead writer can't hang the
+    ; readers forever) and gives the writer a periodic idle wakeup.
+    wait_timeout dq 1, 0          ; 1 second
+
 section .bss
     global queue_head
     global queue_tail
@@ -117,12 +123,13 @@ writer_entry_point:
 .writer_wait:
     ; Sleep until a producer wakes us on queue_tail. RBX still holds the tail
     ; value we observed; if a producer advances tail before we sleep, FUTEX_WAIT
-    ; returns EAGAIN immediately (no lost wakeup).
+    ; returns EAGAIN immediately (no lost wakeup). The timeout bounds the wait
+    ; and gives a periodic idle wakeup (we re-check the queue either way).
     mov rax, SYS_FUTEX
     lea rdi, [queue_tail]
     mov rsi, FUTEX_WAIT
     mov rdx, rbx              ; expected value = current tail
-    xor r10, r10
+    lea r10, [wait_timeout]   ; bounded wait (1s)
     syscall
     jmp .writer_poll
 
@@ -160,9 +167,24 @@ enqueue_job:
     lea rdi, [queue_head]
     mov rsi, FUTEX_WAIT
     mov rdx, rbx              ; expected value = current head
-    xor r10, r10
+    lea r10, [wait_timeout]   ; bounded wait (1s): never hang on a dead writer
     syscall
-    jmp .enqueue_retry
+    ; 0 = woken, -EAGAIN (-11) = head advanced, -ETIMEDOUT (-110) = timeout.
+    cmp rax, 0
+    je .enqueue_retry
+    cmp rax, -11
+    je .enqueue_retry
+    jmp .give_up               ; timeout/error: writer likely dead, drop the job
+
+.give_up:
+    ; Do NOT set TLS_ASYNC_HANDOFF: the reader sees 0 and closes the socket
+    ; itself instead of waiting on a writer that is no longer draining.
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
 
 .slot_ready:
     ; RAX = current queue_tail

@@ -37,15 +37,15 @@ seq 5000 | xargs -P 20 -I{} curl -s -o /dev/null -X POST "http://localhost:8080/
 | Fase | GET req/s | SET req/s | Notas |
 | --- | --- | --- | --- |
 | 0 (baseline) | 1244 | 155 | seqlock decorativo, msync por request, accept serial. |
-| 1 (seqlock por shard) | 1217 | 822 | lectura ya era consistente; la escritura ya no sincroniza 64MB por request (ver nota). |
+| 1+3 (seqlock por shard + group commit) | 1217 | 822 | **SET 155 → 822 req/s (~5.3x)**; el salto proviene de quitar `flush_shard` del camino caliente. |
 | 2 (futex) | — | — | no cambia el hot path de datos (solo backpressure). |
-| 3 (group commit) | 1217 | 822 | **SET 155 → 822 req/s (~5.3x)**. El flush diferido manda. |
 | 4 (acceptor+workers+epoll) | — | — | |
 | 5 (final, B-tree con geometría dinámica de clave) | **1224** | **885** | sin regresión en lectura; SET **~5.7x** vs baseline. |
 
-> Nota: la medición de SET de la Fase 1 ya refleja el group commit (Fase 3),
-> porque ambas se midieron juntas al cerrar la Fase 3. El salto 155→822 proviene
-> exclusivamente de quitar `flush_shard` del camino caliente.
+> Nota: el seqlock por shard (Fase 1) y el group commit (Fase 3) se midieron
+> juntos al cerrar la Fase 3, por eso se reportan consolidados en una sola fila.
+> El salto 155→822 proviene exclusivamente de quitar `flush_shard` del camino
+> caliente (no del seqlock, que no toca la escritura).
 
 ## Stress test k6 (fase final)
 
