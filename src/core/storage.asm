@@ -18,6 +18,7 @@ section .data
     db_dir       db "db", 0
     db_misc_name db "db/misc.db", 0
     db_size      equ 67108864    ; Hardcoded 64MB
+    MS_ASYNC     equ 1           ; MS_ASYNC flag for sys_msync (non-blocking writeback)
     MS_SYNC      equ 4           ; MS_SYNC flag for sys_msync
 
     msg_init     db "Storage: Initializing 27 shards (64MB each)...", 0
@@ -27,18 +28,26 @@ section .data
 
 section .bss
     global db_ptrs
+    global seq_locks
     db_ptrs      resq 27
+    seq_locks    resq 27
     shard_name   resb 64
 
 section .text
     global init_storage
     global flush_shard
+    global flush_all_shards
     global get_shard_ptr
+    global get_shard_index
+    global shard_seq_inc
+    global shard_seq_read
 
 ; -----------------------------------------------------------------------------
-; get_shard_ptr: Resolves the shard base address based on the key.
+; get_shard_index: Resolves the shard index (0-26) from the key's first char.
+; Input:  RSI = key pointer.
+; Output: RAX = index (0-26). Clobbers RAX only.
 ; -----------------------------------------------------------------------------
-get_shard_ptr:
+get_shard_index:
     movzx rax, byte [rsi]
     cmp al, 'A'
     jl .not_upper
@@ -50,23 +59,94 @@ get_shard_ptr:
     cmp al, 25
     jbe .valid_alpha
     mov rax, 26
-    jmp .load_ptr
+    ret
 .valid_alpha:
     movzx rax, al
-.load_ptr:
+    ret
+
+; -----------------------------------------------------------------------------
+; get_shard_ptr: Resolves the shard base address based on the key.
+; Input:  RSI = key pointer. Output: RDX = shard base pointer.
+; -----------------------------------------------------------------------------
+get_shard_ptr:
+    call get_shard_index
     shl rax, 3
     lea rcx, [db_ptrs]
     mov rdx, [rcx + rax]
     ret
 
 ; -----------------------------------------------------------------------------
-; flush_shard: Synchronizes memory pages with the physical disk.
+; shard_seq_inc: Increments the seqlock of a shard (writer begin/end barrier).
+; Input:  RDI = shard index (0-26). Clobbers RAX, RCX.
+; -----------------------------------------------------------------------------
+shard_seq_inc:
+    ; Memory contract: `lock inc` is a full barrier (implicit release+acquire).
+    ; On writer BEGIN it acts as the release for all B+Tree writes done before it,
+    ; and on writer END it releases the writes to the readers that later observe
+    ; an even sequence. Do NOT replace with a plain `inc`/`xadd` without lock,
+    ; or the seqlock breaks silently.
+    mov rax, rdi
+    shl rax, 3
+    lea rcx, [seq_locks]
+    lock inc qword [rcx + rax]
+    ret
+
+; -----------------------------------------------------------------------------
+; shard_seq_read: Reads the seqlock of a shard (reader snapshot).
+; Input:  RDI = shard index (0-26). Output: RAX = current sequence. Clobbers RCX.
+; -----------------------------------------------------------------------------
+shard_seq_read:
+    ; A plain load is correct on x86 TSO: loads do not reorder with later loads,
+    ; so the data reads that follow this snapshot can never be hoisted above the
+    ; seq1 read. Do NOT introduce `prefetch`/`movntdqa`/weak loads here (or when
+    ; porting to a weaker ISA) without re-adding an acquire fence.
+    mov rax, rdi
+    shl rax, 3
+    lea rcx, [seq_locks]
+    mov rax, [rcx + rax]
+    ret
+
+; -----------------------------------------------------------------------------
+; flush_shard: Synchronizes memory pages of ONE shard with the physical disk.
+; Input: RDI = shard base pointer. Clobbers RAX, RSI, RDX.
 ; -----------------------------------------------------------------------------
 flush_shard:
     mov rax, 26                 ; sys_msync
     mov rsi, db_size
     mov rdx, MS_SYNC
     syscall
+    ret
+
+; -----------------------------------------------------------------------------
+; flush_all_shards: Group-commit the mmap of all 27 shards to disk.
+; Called periodically by the writer thread (NOT per request). Durability of
+; individual writes is already guaranteed by the O_DSYNC WAL; this only keeps
+; the shard files eventually consistent so recovery can later skip stale WAL.
+; Uses MS_ASYNC (not MS_SYNC): the kernel schedules writeback without blocking
+; the writer, avoiding the periodic ~1.7GB stall that MS_SYNC would reintroduce.
+; Clobbers RAX, RBX, R12, RSI, RDX, RDI.
+; -----------------------------------------------------------------------------
+flush_all_shards:
+    push rbx
+    push r12
+    xor r12, r12
+.fa_loop:
+    cmp r12, 27
+    je .fa_done
+    mov rbx, [db_ptrs + r12*8]
+    test rbx, rbx
+    jz .fa_next
+    mov rdi, rbx
+    mov rax, 26                 ; sys_msync
+    mov rsi, db_size
+    mov rdx, MS_ASYNC
+    syscall
+.fa_next:
+    inc r12
+    jmp .fa_loop
+.fa_done:
+    pop r12
+    pop rbx
     ret
 
 ; -----------------------------------------------------------------------------

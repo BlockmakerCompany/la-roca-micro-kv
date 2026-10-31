@@ -7,17 +7,12 @@
 %include "config.inc"
 
 extern get_shard_ptr
-extern handle_get, handle_set, handle_del, handle_scan, handle_400, handle_404
+extern handle_get, handle_scan, handle_400, handle_404
+extern enqueue_job
 extern rt_key_size
 
-section .bss
-    global validated_key
-    validated_key resb 256
-
-    global q_prefix, q_startkey, q_limit
-    q_prefix   resb 256
-    q_startkey resb 256
-    q_limit    resd 1
+; NOTE: validated_key, q_prefix, q_startkey and q_limit now live in each
+; thread's TLS block (see config.inc). They are accessed as fs:[TLS_*].
 
 section .text
     global route_keys
@@ -119,13 +114,15 @@ route_keys:
     inc rsi                     ; RSI points to key content
 
     ; 2. Clear validated_key buffer
-    lea rdi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_VALIDATED_KEY]
     xor rax, rax
     mov rcx, 32
     rep stosq
 
     ; 3. Key Extraction
-    lea rdi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_VALIDATED_KEY]
     xor rcx, rcx
 .v_loop:
     lodsb
@@ -135,8 +132,8 @@ route_keys:
     jz .v_done
 
     inc rcx
-    cmp rcx, 31                 ; Shard slot limit
-    ja .err_400
+    cmp rcx, [rt_key_size]      ; Shard slot limit (dynamic geometry)
+    jae .err_400
 
     stosb
     jmp .v_loop
@@ -146,7 +143,8 @@ route_keys:
     jz .not_handled
 
     ; 4. Dispatch to Shards and Handlers
-    lea rsi, [validated_key]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_VALIDATED_KEY]
     call get_shard_ptr
     mov rdi, rdx                ; Shard pointer
     mov rsi, r13                ; Request buffer
@@ -157,14 +155,24 @@ route_keys:
     je .call_get
     cmp eax, 0x54534F50         ; POST
     je .call_set
-    call handle_del
-    jmp .handled
+    cmp eax, 0x454C4544         ; DELE
+    je .call_del
+    jmp .not_handled
 
 .call_get:
     call handle_get
     jmp .handled
 .call_set:
-    call handle_set
+    mov rdi, r12                ; Client Socket FD
+    mov rsi, 1                  ; Opcode = 1 (SET)
+    mov rdx, r13                ; Raw Request Buffer
+    call enqueue_job
+    jmp .handled
+.call_del:
+    mov rdi, r12                ; Client Socket FD
+    mov rsi, 2                  ; Opcode = 2 (DEL)
+    mov rdx, r13                ; Raw Request Buffer
+    call enqueue_job
     jmp .handled
 .call_scan:
     mov rdi, r12

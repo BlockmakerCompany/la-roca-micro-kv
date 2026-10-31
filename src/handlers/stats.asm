@@ -26,15 +26,13 @@ section .data
     j_end       db '}', 0x0A
     len_end     equ $ - j_end
 
-section .bss
-    num_buf     resb 32
-
 section .text
     global handle_stats
 
 handle_stats:
     push rbp
     mov rbp, rsp
+    sub rsp, 32                 ; Reentrant buffer for .send_number
     push rbx
     push r12
     push r13
@@ -128,7 +126,7 @@ handle_stats:
 
 ; Helper for numeric streaming
 .send_number:
-    lea rdi, [num_buf + 31]
+    lea rdi, [rbp - 1]
     mov byte [rdi], 0
     mov rbx, 10
     test rax, rax
@@ -146,7 +144,7 @@ handle_stats:
     jnz .itoa_loop
 .write_sys:
     mov rsi, rdi
-    lea r8, [num_buf + 31]
+    lea r8, [rbp - 1]
     sub r8, rdi
     mov rdx, r8
     mov rax, 1

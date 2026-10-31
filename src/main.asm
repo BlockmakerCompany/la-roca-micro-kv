@@ -2,10 +2,16 @@
 ; Module: src/main.asm
 ; Project: La Roca Micro-KV
 ; Responsibility: Orchestrates dynamic initialization and the main event loop.
-;                 Implements synchronous I/O and HTTP Keep-Alive.
-;                 Includes Low-Level Telemetry for Buffer Debugging.
+;                 Implements synchronous I/O, HTTP Keep-Alive, and spawns
+;                 the secondary Writer Thread for concurrent operations.
 ; -----------------------------------------------------------------------------
 %include "config.inc"
+
+%define NUM_READERS     16          ; reader threads (parent + 15 children).
+                                    ; GET is served synchronously by a reader, so more
+                                    ; readers = more concurrent lock-free reads under load.
+                                    ; TLS blocks and stacks are allocated parametrically.
+%define READER_STACK    65536       ; stack size per child reader thread
 
 ; --- External Engine Modules ---
 extern init_runtime_config
@@ -15,6 +21,7 @@ extern parse_log_level
 extern log_msg
 extern route_request
 extern recover_from_wal
+extern writer_entry_point   ; <--- Import the Writer Thread from worker.asm
 
 section .data
     ; sockaddr_in structure for IPv4
@@ -37,19 +44,37 @@ section .data
     act_ignore   dq 1, 0, 0, 0  ; SIG_IGN for SIGPIPE
 
     ; struct timeval { time_t tv_sec; suseconds_t tv_usec; }
-    tv_timeout   dq 0, 10000        ; 10 milliseconds timeout for Keep-Alive sockets
+    tv_timeout   dq 1, 0            ; 1 second timeout for Keep-Alive sockets.
+                                    ; 10ms was too aggressive: under high VU load it closed
+                                    ; idle keep-alive connections mid-handshake (EOF/RST).
     keep_alive_str db "keep-alive"
+
+    ; Flags for sys_clone: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
+    clone_flags  dq 0x010F00
+    ; Same as above + CLONE_SETTLS (0x00080000): each reader thread gets its own FS base.
+    reader_clone_flags dq 0x090F00
+    msg_writer   db "[INFO] Writer Thread spawned successfully.", 0x0A
+    len_writer   equ $ - msg_writer
+    msg_reader   db "[INFO] Reader Thread online.", 0x0A
+    len_reader   equ $ - msg_reader
 
 section .bss
     global log_level
     global wal_fd
+
     log_level    resb 1
     server_fd    resq 1
     wal_fd       resq 1
-    client_fd    resq 1
-    ka_flag      resb 1         ; Keep-Alive state flag
-    request_buf  resb 8192
     debug_num    resb 16        ; Buffer for ITOS telemetry
+
+    ; 1. Stack for the writing thread (64KB)
+    writer_stack resb 65536
+
+    ; 2. Per-thread context (TLS) blocks for reader threads
+    tls_blocks    resb NUM_READERS * TLS_SIZE
+
+    ; 3. Stacks for the child reader threads (parent uses the main stack)
+    reader_stacks resb (NUM_READERS - 1) * READER_STACK
 
 section .text
     global _start
@@ -95,7 +120,26 @@ _start:
     mov rdx, len_wal
     call log_msg
 
-    ; --- Step 5: Network Stack ---
+    ; --- Step 5: Spawn the Writer Thread (sys_clone) ---
+    mov rax, 56                 ; sys_clone
+    mov rdi, [clone_flags]
+    lea rsi, [writer_stack + 65536] ; Top of the new stack
+    xor rdx, rdx
+    xor r10, r10
+    xor r8, r8
+    syscall
+
+    test rax, rax
+    js .clone_failed            ; If < 0, sys_clone failed
+    jz writer_entry_point       ; If 0, WE ARE THE NEW WRITER THREAD! Jump to worker.asm
+
+    ; --- MAIN THREAD (Reader) CONTINUES HERE ---
+    mov rdi, 1
+    lea rsi, [msg_writer]
+    mov rdx, len_writer
+    call log_msg
+
+    ; --- Step 6: Network Stack Initialization ---
     mov rax, 41                 ; sys_socket
     mov rdi, 2                  ; AF_INET
     mov rsi, 1                  ; SOCK_STREAM
@@ -114,7 +158,18 @@ _start:
     syscall
     pop rax
 
-    ; --- Step 6: Dynamic Binding ---
+    ; Set SO_REUSEPORT
+    mov rax, 54
+    mov rdi, [server_fd]
+    mov rsi, 1
+    mov rdx, 15
+    push 1
+    mov r10, rsp
+    mov r8, 4
+    syscall
+    pop rax
+
+    ; --- Step 7: Dynamic Binding ---
     mov ax, [rt_port]
     xchg al, ah                 ; Byte-swap for Network Byte Order
     mov [sockaddr + 2], ax
@@ -124,10 +179,12 @@ _start:
     lea rsi, [sockaddr]
     mov rdx, 16
     syscall
+    test rax, rax
+    js .bind_failed
 
     mov rax, 50                 ; sys_listen
     mov rdi, [server_fd]
-    mov rsi, 128                ; Increased backlog for high-concurrency
+    mov rsi, 4096               ; Backlog: keep 500+ VUs queued instead of RST on overflow
     syscall
 
     mov rdi, 1
@@ -135,10 +192,72 @@ _start:
     mov rdx, len_start
     call log_msg
 
+    ; --- Step 8: Initialize TLS self-pointers and set parent FS base ---
+    xor rcx, rcx
+.init_tls_self:
+    cmp rcx, NUM_READERS
+    je .init_tls_done
+    mov rax, rcx
+    imul rax, TLS_SIZE
+    lea rdx, [tls_blocks + rax]
+    mov [rdx + TLS_SELF], rdx
+    inc rcx
+    jmp .init_tls_self
+.init_tls_done:
+
+    mov rax, 158                ; sys_arch_prctl
+    mov rdi, 0x1002             ; ARCH_SET_FS
+    lea rsi, [tls_blocks]       ; parent reader thread uses block 0
+    syscall
+
+    ; --- Step 9: Spawn NUM_READERS-1 child reader threads ---
+    xor r12, r12                ; r12 = child index (0 .. NUM_READERS-2)
+.spawn_readers:
+    cmp r12, NUM_READERS - 1
+    je .parent_reader
+
+    ; TLS pointer for this child = tls_blocks + (r12+1)*TLS_SIZE
+    mov rax, r12
+    inc rax
+    imul rax, TLS_SIZE
+    lea r8, [tls_blocks + rax]  ; r8 = tls (CLONE_SETTLS -> FS base)
+
+    ; Child stack top = reader_stacks + (r12+1)*READER_STACK
+    mov rax, r12
+    inc rax
+    imul rax, READER_STACK
+    lea rsi, [reader_stacks + rax]
+
+    mov rax, 56                 ; sys_clone
+    mov rdi, [reader_clone_flags]
+    xor rdx, rdx                ; parent_tidptr
+    xor r10, r10                ; child_tidptr
+    syscall
+
+    test rax, rax
+    js .clone_failed
+    jz reader_entry             ; child: enter accept loop with its own FS
+
+    inc r12
+    jmp .spawn_readers
+
+.parent_reader:
+    jmp reader_entry
+
+.bind_failed:
+.clone_failed:
+    ; Exit gracefully if bind or thread spawning fails
+    mov rax, 60
+    mov rdi, 1
+    syscall
+
 ; -----------------------------------------------------------------------------
-; MAIN EVENT LOOP
+; MAIN EVENT LOOP (Reader Thread)
 ; -----------------------------------------------------------------------------
-.accept_loop:
+; -----------------------------------------------------------------------------
+; READER ENTRY: each reader thread runs this accept/serve loop on its own TLS.
+; -----------------------------------------------------------------------------
+reader_entry:
     mov rax, 43                 ; sys_accept
     mov rdi, [server_fd]
     xor rsi, rsi
@@ -146,12 +265,12 @@ _start:
     syscall
 
     test rax, rax
-    js .accept_loop
-    mov [client_fd], rax
+    js reader_entry
+    mov [fs:TLS_CLIENT_FD], rax
 
-    ; 🛡️ Set SO_RCVTIMEO to prevent Keep-Alive deadlocks (5 sec timeout)
+    ; 🛡️ Set SO_RCVTIMEO to prevent Keep-Alive deadlocks
     mov rax, 54                 ; sys_setsockopt
-    mov rdi, [client_fd]
+    mov rdi, [fs:TLS_CLIENT_FD]
     mov rsi, 1                  ; SOL_SOCKET
     mov rdx, 20                 ; SO_RCVTIMEO
     lea r10, [tv_timeout]       ; struct timeval
@@ -161,94 +280,68 @@ _start:
 .keep_alive_loop:
     cld                         ; 1. Direction forward
 
+    ; 🛡️ Clear the Async Handoff Flag for this new request
+    mov byte [fs:TLS_ASYNC_HANDOFF], 0
+
     ; --- 2. Clean the buffer (Total reset to avoid ghost data) ---
-    lea rdi, [request_buf]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_REQUEST_BUF]
     xor rax, rax
-    mov rcx, 1024                ; 2048 bytes
+    mov rcx, 1024               ; 8192 bytes
     rep stosq
 
     ; --- 3. Fresh Read from Socket ---
     mov rax, 0                  ; sys_read
-    mov rdi, [client_fd]
-    lea rsi, [request_buf]
+    mov rdi, [fs:TLS_CLIENT_FD]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_REQUEST_BUF]
     mov rdx, 8191
     syscall
-
-    ; --- 📊 TELEMETRY BLOCK ---
-    push rax                    ; Save actual bytes read
-    test rax, rax
-    jle .skip_telemetry
-
-    ; Print "[DEBUG] Bytes read: "
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [msg_debug_read]
-    mov rdx, len_debug_read
-    syscall
-
-    ; Convert RAX (bytes read) to ASCII and print
-    pop rax
-    push rax
-    call .print_rax_metrics
-
-    ; Print " | Peek: "
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [msg_debug_hex]
-    mov rdx, len_debug_hex
-    syscall
-
-    ; Print first 16 bytes of buffer (The HTTP Verb/Path)
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [request_buf]
-    mov rdx, 24                 ; 24 bytes to see the path
-    syscall
-
-    ; Newline
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [msg_newline]
-    mov rdx, 1
-    syscall
-
-.skip_telemetry:
-    pop rax                     ; Recover original RAX (bytes read)
-    ; --------------------------
 
     test rax, rax
     jle .close_client
 
+
     ; Null-terminate for scanners
-    lea rbx, [request_buf]
+    mov r11, [fs:TLS_SELF]
+    lea rbx, [r11 + TLS_REQUEST_BUF]
     mov byte [rbx + rax], 0
 
     ; --- 5. Keep-Alive Detection ---
     push rax
-    lea rdi, [request_buf]
+    mov r11, [fs:TLS_SELF]
+    lea rdi, [r11 + TLS_REQUEST_BUF]
     mov rsi, rax
     call check_keep_alive
-    mov [ka_flag], al
+    mov byte [fs:TLS_KA_FLAG], al
     pop rax
 
     ; --- 6. Route Dispatch ---
-    mov rdi, [client_fd]
-    lea rsi, [request_buf]
+    mov rdi, [fs:TLS_CLIENT_FD]
+    mov r11, [fs:TLS_SELF]
+    lea rsi, [r11 + TLS_REQUEST_BUF]
     call route_request
 
     ; --- 7. Decision ---
-    cmp byte [ka_flag], 1
-    je .keep_alive_loop
+    ; 🛡️ CHECK MEMORY FLAG: Did the router push this to the Worker Queue?
+    cmp byte [fs:TLS_ASYNC_HANDOFF], 1
+    je reader_entry             ; YES: Abandon socket, Writer Thread owns it now!
+
+    cmp byte [fs:TLS_KA_FLAG], 1
+    je .keep_alive_loop         ; NO: Standard Keep-Alive handling
 
 .close_client:
     mov rax, 3
-    mov rdi, [client_fd]
+    mov rdi, [fs:TLS_CLIENT_FD]
     syscall
-    jmp .accept_loop
+    jmp reader_entry
 
 ; --- Helper: ITOS for Telemetry ---
 .print_rax_metrics:
-    lea rdi, [debug_num + 15]
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16                 ; Thread-safe stack buffer
+    lea rdi, [rbp - 1]
     mov byte [rdi], 0
     mov rbx, 10
 .itos_loop:
@@ -260,13 +353,13 @@ _start:
     test rax, rax
     jnz .itos_loop
 
-    ; Print the number
     mov rax, 1
     mov rsi, rdi
-    lea rdx, [debug_num + 15]
+    lea rdx, [rbp - 1]
     sub rdx, rdi
     mov rdi, 1
     syscall
+    leave
     ret
 
 ; -----------------------------------------------------------------------------

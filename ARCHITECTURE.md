@@ -13,7 +13,7 @@ Dynamic memory allocation is the enemy of predictable latency. In Assembly, ever
 
 La Roca splits its shards into two distinct physical realms managed without `libc`:
 * **The Data Space (Append-Only):** Records are written sequentially into fixed **1024-byte (1KB) slots** using a lightning-fast *Bump Allocator*. Data never moves once written.
-* **The Index Space (B+ Tree):** To find records instantly, a 2-Level B+ Tree stores the 32-byte Keys and an 8-byte absolute memory pointer to the Data Slot.
+* **The Index Space (B+ Tree):** To find records instantly, a 2-Level B+ Tree stores the keys (32 bytes by default, configurable via `ROCK_KEY_SIZE` at runtime) and an 8-byte absolute memory pointer to the Data Slot. The B+ Tree geometry — entry width and node capacity — is recomputed dynamically from the active key size.
 
 By separating the index from the payload, an update to an existing key is a simple $O(1)$ **In-Place Pointer Swap** in the B+ Tree, bypassing the need to move megabytes of data.
 
@@ -116,8 +116,8 @@ By eliminating the dependency on `libc.so` or `musl`, we achieve a level of bina
 ### 3.2 High-Performance Networking & The Persistent Event Loop
 The networking stack is built on the raw Berkeley Sockets API provided by the kernel, optimized for the lowest possible latency and minimal context-switching.
 
-* **The Keep-Alive Engine:** Instead of suffering the expensive TCP 3-way handshake for every request, La Roca implements a persistent, single-threaded event loop. Valid requests keep the file descriptor open, dropping p(95) latency to **under 1 millisecond (~800µs)**.
-* **Hardware Deadlock Protection:** To prevent a malicious client from holding the single-threaded loop hostage, the engine injects a strict `SO_RCVTIMEO` (Receive Timeout) via `sys_setsockopt`. If a client remains idle for 10ms, the Kernel aggressively drops the connection, allowing the engine to serve the next user instantly.
+* **The Keep-Alive Engine:** Instead of suffering the expensive TCP 3-way handshake for every request, La Roca implements a persistent accept loop (writes are handed off to a dedicated writer thread — see §3.4). Valid requests keep the file descriptor open, dropping read p(95) latency to **under 1 millisecond (~800µs)**.
+* **Hardware Deadlock Protection:** To prevent a malicious client from holding the accept loop hostage, the engine injects a strict `SO_RCVTIMEO` (Receive Timeout) via `sys_setsockopt`. If a client remains idle for 10ms, the Kernel aggressively drops the connection, allowing the engine to serve the next user instantly.
 * **Memory-Network Synergy:** Data received from the network is read directly into a pre-allocated **8KB buffer**. By eliminating intermediate abstractions and allocating raw space for 4KB headers, we drastically reduce CPU cycle consumption per request.
 
 ### 3.3 The Assembly HTTP Parser: Attack Surface Reduction
@@ -141,22 +141,30 @@ graph TD
     style Loop fill:#cff4fc,stroke:#055160
 ```
 
-### 3.3 The Assembly HTTP Parser: Attack Surface Reduction
-General-purpose HTTP parsers are often multi-megabyte liabilities prone to complex exploits. La Roca uses a **Minimalist State Machine** written in pure Assembly.
+---
 
-* **Byte-by-Byte Scanning:** Instead of using expensive string functions, the engine scans the input buffer in a single pass using the `lodsb` instruction.
-* **Security by Omission:** By not implementing 99% of unnecessary HTTP specifications, we eliminate entire classes of vulnerabilities (e.g., Request Smuggling).
-* **The "Drop-on-Error" Policy:** If the incoming bytes do not strictly match our expected REST verbs, the engine triggers an immediate `sys_close`. This makes the engine an extremely small and "hard" target.
+## 3.4 Concurrency Model: Single-Writer, Multi-Reader (SWMR)
 
-```mermaid
-graph TD
-    Socket[TCP Socket] -->|Raw Bytes| Parser{Assembly State Machine}
-    Parser -->|Invalid/Bloat| Drop[sys_close / Instant Reject]
-    Parser -->|Valid GET/POST| Action[Process Route]
-    
-    style Drop fill:#f8d7da,stroke:#842029
-    style Action fill:#d1e7dd,stroke:#0f5132
-```
+La Roca serves reads and writes on separate paths, protected by a
+**per-shard seqlock** so a reader never observes a half-mutated B+ Tree.
+
+* **Writer thread:** a single `sys_clone` thread drains a fixed-size job ring
+  buffer (`enqueue_job`). SET/DELETE requests are enqueued by the acceptor and
+  applied by the writer, serializing all mutations per process.
+* **Per-shard seqlock (`seq_locks[27]`):** the writer bumps the target shard's
+  sequence counter to an odd value, mutates the B+ Tree in place, then bumps it
+  back to even. Readers (`btree_find`, `handle_scan`) validate parity and retry
+  on the standard seqlock protocol — a point GET is atomically consistent.
+* **Futex backpressure:** producer and consumer block on
+  `FUTEX_WAIT`/`FUTEX_WAKE` instead of busy-polling, so a burst cannot silently
+  overflow the ring buffer.
+* **Group commit:** the hot write path no longer `msync`s the full 64MB shard per
+  request. Durability is carried by the WAL opened with `O_DSYNC`; the writer
+  flushes shards in batches (`flush_all_shards`). This lifted local SET
+  throughput from ~155 to ~885 req/s (~5.7x).
+
+The phase-by-phase rationale lives in `docs/concurrency.md` and
+`docs/ADR-0001-concurrency-model.md`.
 
 ---
 
@@ -201,7 +209,7 @@ La Roca is designed to be the bedrock of a new generation of hyper-efficient inf
 
 * **Design & Architecture:** Fernando E. Mancuso & BlockMaker Engineering
 * **Organization:** [BlockmakerCompany](https://github.com/BlockmakerCompany)
-* **Release:** April 2026 | Stable Build 1.1.0
+* **Release:** April 2026 | Stable Build 1.2.0
 * **Inquiries:** For industrial integration or low-level consulting, reach out via [GitHub Issues](https://github.com/BlockmakerCompany/la-roca-micro-kv/issues).
 
 > *"If it requires a library, it doesn't belong in the core."* > — **The BlockMaker Manifesto**
